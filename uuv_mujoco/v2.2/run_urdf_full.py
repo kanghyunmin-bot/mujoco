@@ -1400,6 +1400,13 @@ def main() -> None:
     thruster_force_max = float(sim_profile.get("thruster_force_max", 50.0))
     linear_drag = float(sim_profile.get("linear_drag", 1.2))
     angular_drag = float(sim_profile.get("angular_drag", 0.12))
+    # Keep tiny damping in air; full damping only when submerged.
+    air_linear_drag = float(
+        np.clip(sim_profile.get("air_linear_drag", linear_drag * 0.03), 0.0, linear_drag)
+    )
+    air_angular_drag = float(
+        np.clip(sim_profile.get("air_angular_drag", angular_drag * 0.05), 0.0, angular_drag)
+    )
     spin_gain = float(sim_profile.get("spin_gain", 22.0))
 
     # Vertical allocator for roll/pitch stabilization using vertical thrusters.
@@ -1500,6 +1507,7 @@ def main() -> None:
         frac = np.clip((depth + half_height) / (2.0 * half_height), 0.0, 1.0)
         buoy = rho * g * neutral_volume * frac * buoyancy_scale
         buoy_force_world = np.array([0.0, 0.0, buoy], dtype=np.float64)
+        submerged = float(frac)
 
         # MuJoCo xfrc_applied layout: [force_xyz, torque_xyz].
         data.xfrc_applied[base_id, 0:3] += buoy_force_world
@@ -1508,11 +1516,13 @@ def main() -> None:
             buoy_tau_world = np.cross(r, buoy_force_world) * cob_torque_scale
             data.xfrc_applied[base_id, 3:6] += buoy_tau_world
 
-        # Mild global damping for stable, less exaggerated motion.
+        # Blend damping by immersion: near-surface transitions are smooth.
         ang_vel = data.cvel[base_id, 0:3]
         lin_vel = data.cvel[base_id, 3:6]
-        data.xfrc_applied[base_id, 0:3] -= linear_drag * lin_vel
-        data.xfrc_applied[base_id, 3:6] -= angular_drag * ang_vel
+        lin_drag_coeff = air_linear_drag + (linear_drag - air_linear_drag) * submerged
+        ang_drag_coeff = air_angular_drag + (angular_drag - air_angular_drag) * submerged
+        data.xfrc_applied[base_id, 0:3] -= lin_drag_coeff * lin_vel
+        data.xfrc_applied[base_id, 3:6] -= ang_drag_coeff * ang_vel
 
         if imu_stabilize_active["value"] and imu_stab_mode in ("torque", "both"):
             data.xfrc_applied[base_id, 3:6] += imu_stab_cache["tau_world"]
