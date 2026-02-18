@@ -35,12 +35,6 @@ while [[ $# -gt 0 ]]; do
             FORCE_ROS2=true
             shift
             ;;
-        --hover-stable)
-            # Backward-compatibility alias: use hover-tuned profile.
-            EXTRA_ARGS+=("--profile" "sim_hover")
-            FORCE_ROS2=true
-            shift
-            ;;
         --calib-left)
             if [[ $# -lt 2 ]]; then
                 echo "Missing value for --calib-left"
@@ -88,6 +82,9 @@ echo ""
 
 if [ "$FORCE_ROS2" = true ]; then
     EXTRA_ARGS+=("--ros2")
+    if [[ -n "$SITL_ARG" ]]; then
+        EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
+    fi
 fi
 
 python3 run_urdf_full.py \
