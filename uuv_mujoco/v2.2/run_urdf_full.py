@@ -413,6 +413,9 @@ def main() -> None:
     # Load model/state once and reuse for runtime, validation, and calibration paths.
     model = mujoco.MjModel.from_xml_path(args.scene)
     data = mujoco.MjData(model)
+    # Initialize derived state once before runtime loops so launch start poses,
+    # sensor readings, and depth-hold reference use valid base position.
+    mujoco.mj_forward(model, data)
 
     # Identify base body
     base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")

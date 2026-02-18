@@ -35,6 +35,13 @@ while [[ $# -gt 0 ]]; do
             FORCE_ROS2=true
             shift
             ;;
+        --hover-stable)
+            # Backward-compatible alias. Previously used by users for
+            # default depth-hold + IMU-stabilize behavior.
+            EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
+            FORCE_ROS2=true
+            shift
+            ;;
         --calib-left)
             if [[ $# -lt 2 ]]; then
                 echo "Missing value for --calib-left"

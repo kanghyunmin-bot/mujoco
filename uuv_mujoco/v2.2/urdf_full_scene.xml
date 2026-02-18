@@ -87,8 +87,8 @@
       
       <site name="cam_left_site" pos="0.3300 0.1700 -0.2050" size="0.018" rgba="1 0 1 1" />
       <site name="cam_right_site" pos="0.3300 0.1700 -0.1600" size="0.018" rgba="1 0.5 0 1" />
-      <camera name="stereo_left" pos="0.3300 0.1700 -0.2050" quat="0 -0.7071068 0 0.7071068" fovy="70" />
-      <camera name="stereo_right" pos="0.3300 0.1700 -0.1600" quat="0 -0.7071068 0 0.7071068" fovy="70" />
+      <camera name="stereo_left" pos="0.3300 0.1700 -0.2050" quat="0.1830127 0.6830127 0.1830127 -0.6830127" fovy="70" />
+      <camera name="stereo_right" pos="0.3300 0.1700 -0.1600" quat="0.1830127 0.6830127 0.1830127 -0.6830127" fovy="70" />
 
       
       <!-- Visual-only propeller bodies (spin joints are driven by runtime code) -->
