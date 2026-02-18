@@ -10,6 +10,7 @@ Responsibilities:
 """
 
 import json
+import os
 import socket
 import time
 from pathlib import Path
@@ -151,10 +152,17 @@ class Ros2Bridge:
         self._pwm_min = 1100
         self._pwm_max = 1900
         self._pwm_neutral = 1500
-        self._ch_forward = 4  # ArduSub channel mapping
-        self._ch_lateral = 5
-        self._ch_throttle = 2
-        self._ch_yaw = 3
+        # MAVLink RC input order is Roll(1), Pitch(2), Throttle(3), Yaw(4).
+        # Zero-based indices are used below.
+        self._ch_forward = self._env_to_int("ROS2_UUV_RC_CH_FORWARD", 1)
+        self._ch_lateral = self._env_to_int("ROS2_UUV_RC_CH_LATERAL", 0)
+        self._ch_throttle = self._env_to_int("ROS2_UUV_RC_CH_THROTTLE", 2)
+        self._ch_yaw = self._env_to_int("ROS2_UUV_RC_CH_YAW", 3)
+        self.node.get_logger().info(
+            f"Using MAVLink RC override channel map: "
+            f"forward={self._ch_forward}, lateral={self._ch_lateral}, "
+            f"throttle={self._ch_throttle}, yaw={self._ch_yaw}"
+        )
 
         self.model = model
         self.sensor_ids = {}
@@ -224,6 +232,18 @@ class Ros2Bridge:
         if abs(value) <= self._cmd_deadband_norm:
             return 0.0
         return float(np.clip(value, -1.0, 1.0))
+
+    @staticmethod
+    def _env_to_int(env_name: str, default: int) -> int:
+        value = os.getenv(env_name)
+        if not value:
+            return default
+        try:
+            parsed = int(value)
+        except ValueError:
+            print(f"[ros2_bridge] invalid {env_name}={value!r}, using {default}", flush=True)
+            return default
+        return max(0, parsed)
 
     def _handle_normalized_cmd(
         self,

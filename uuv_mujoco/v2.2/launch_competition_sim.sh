@@ -19,6 +19,7 @@ FORCE_ROS2=false
 HEADLESS_ARG=""
 SITL_ARG=""
 EXTRA_ARGS=()
+PROFILE=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --headless)
@@ -36,11 +37,21 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --hover-stable)
-            # Backward-compatible alias. Previously used by users for
-            # default depth-hold + IMU-stabilize behavior.
+            # Backward-compatible alias for legacy SITL behavior.
+            # Keeps existing strong stabilization and depth-hold behavior.
             EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
+            PROFILE="sim_hover"
             FORCE_ROS2=true
             shift
+            ;;
+        --profile)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --profile"
+                exit 2
+            fi
+            PROFILE="$2"
+            EXTRA_ARGS+=("--profile" "$2")
+            shift 2
             ;;
         --calib-left)
             if [[ $# -lt 2 ]]; then
@@ -90,8 +101,17 @@ echo ""
 if [ "$FORCE_ROS2" = true ]; then
     EXTRA_ARGS+=("--ros2")
     if [[ -n "$SITL_ARG" ]]; then
-        EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
+        # Intentionally do not force extra stabilization/depth-hold for SITL.
+        # ArduPilot/QGC depth and attitude modes should own these loops.
+        if [[ -z "$PROFILE" ]]; then
+            PROFILE="sim_real"
+            EXTRA_ARGS+=("--profile" "$PROFILE")
+        fi
     fi
+fi
+
+if [[ -n "$PROFILE" && "$PROFILE" != "sim_real" ]]; then
+    echo "[launch] Simulation profile: $PROFILE"
 fi
 
 python3 run_urdf_full.py \
