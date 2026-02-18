@@ -1,0 +1,61 @@
+{
+  "forward_step": {
+    "target_ss": 0.5817518822912835,
+    "peak": 0.6126190465367304,
+    "overshoot_pct": 5.305898474083782,
+    "settling_time_s": 0.015000000000000346,
+    "steady_state_drift": 0.011416368210779088,
+    "status": "ok",
+    "log_csv": "/home/khm/antigravity/mujoco/uuv_mujoco/v2.2/validation/forward_step.csv",
+    "pass": false,
+    "fail_reasons": [
+      "overshoot_pct > 5.000"
+    ],
+    "thresholds": {
+      "overshoot_pct_max": 5.0,
+      "settling_time_s_max": 0.645,
+      "steady_state_drift_max": 0.1466,
+      "target_ss_abs_min": 0.3048
+    }
+  },
+  "heave_step": {
+    "target_ss": -0.7149862837728675,
+    "peak": -0.8955073871652836,
+    "overshoot_pct": 25.248191117714203,
+    "settling_time_s": null,
+    "steady_state_drift": 0.016273924736445712,
+    "status": "ok",
+    "log_csv": "/home/khm/antigravity/mujoco/uuv_mujoco/v2.2/validation/heave_step.csv",
+    "pass": false,
+    "fail_reasons": [
+      "overshoot_pct > 5.000",
+      "settling_time_s > 0.366"
+    ],
+    "thresholds": {
+      "overshoot_pct_max": 5.0,
+      "settling_time_s_max": 0.366,
+      "steady_state_drift_max": 0.2585,
+      "target_ss_abs_min": 0.2463
+    }
+  },
+  "yaw_step": {
+    "target_ss": 2.1841170034721364,
+    "peak": 2.1850241754901463,
+    "overshoot_pct": 0.041534955158889254,
+    "settling_time_s": 0.02000000000000035,
+    "steady_state_drift": 0.005597603416619919,
+    "status": "ok",
+    "log_csv": "/home/khm/antigravity/mujoco/uuv_mujoco/v2.2/validation/yaw_step.csv",
+    "pass": true,
+    "fail_reasons": [],
+    "thresholds": {
+      "overshoot_pct_max": 5.0,
+      "settling_time_s_max": 0.654,
+      "steady_state_drift_max": 0.8453,
+      "target_ss_abs_min": 1.1403
+    }
+  },
+  "_overall": {
+    "pass": false
+  }
+}
