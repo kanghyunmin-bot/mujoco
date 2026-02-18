@@ -272,6 +272,11 @@ def main() -> None:
         action="store_true",
         help="Run real-time simulation loop without GLFW viewer",
     )
+    parser.add_argument(
+        "--allow-mavros-rc-in-sitl",
+        action="store_true",
+        help="Allow /mavros/rc/override input even in --sitl mode (default: disabled in SITL)",
+    )
     args = parser.parse_args()
 
     # Profile values are externalized so users can retune dynamics without code edits.
@@ -1022,6 +1027,13 @@ def main() -> None:
     if args.ros2:
         try:
             from ros2_bridge import Ros2Bridge
+            enable_mavros_rc = True
+            if args.sitl and not args.allow_mavros_rc_in_sitl:
+                enable_mavros_rc = False
+                print(
+                    "[ros2] SITL mode: /mavros/rc/override input disabled to avoid external override conflicts.",
+                    flush=True,
+                )
 
             ros_bridge = Ros2Bridge(
                 model=model,
@@ -1032,7 +1044,7 @@ def main() -> None:
                 image_height=args.ros2_image_height,
                 sensor_hz=args.ros2_sensor_hz,
                 image_hz=args.ros2_image_hz,
-                enable_mavros=True,
+                enable_mavros=enable_mavros_rc,
                 enable_sitl=args.sitl,
                 sitl_ip=args.sitl_ip,
                 sitl_port=args.sitl_port,
@@ -1040,8 +1052,11 @@ def main() -> None:
                 camera_calib_right=args.ros2_camera_calib_right,
             )
             viewer_control_mode["value"] = False
+            input_topics = "/cmd_vel"
+            if enable_mavros_rc:
+                input_topics += ", /mavros/rc/override"
             print(
-                "[ros2] bridge enabled: /cmd_vel, /mavros/rc/override -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude, /mujoco/ground_truth/pose"
+                f"[ros2] bridge enabled: {input_topics} -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude, /mujoco/ground_truth/pose"
                 + (", /stereo/*" if args.ros2_images else ""),
                 flush=True,
             )
