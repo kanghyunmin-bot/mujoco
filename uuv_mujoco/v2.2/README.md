@@ -87,6 +87,12 @@ python3 run_urdf_full.py --scene ocean_scene.xml
 - `i`: 센서 오버레이 on/off
 - `l`: 쓰러스터 라벨 on/off
 
+### 조이스틱/ROS2 입력
+
+- 기본 실행은 `터미널 + 로컬 조이스틱(/dev/input/js*) + ROS2(/cmd_vel, /mavros/rc/override)` 입력을 모두 지원합니다.
+- 로컬 조이스틱만 끄고 싶다면 `--disable-joystick`을 사용하세요.
+- QGC의 STABILIZE/ALT\_HOLD 같은 모드는 ArduSub 모드에서 처리되며, 시뮬레이터는 `/mavros/rc/override` 또는 `/cmd_vel` 입력을 그대로 받습니다.
+
 ## 4) 검증/캘리브레이션
 
 검증:
@@ -157,10 +163,10 @@ QGroundControl 설정:
 ./scripts/run_stereo_calibration.sh --size 8x6 --square 0.025 --out-dir calibration
 ```
 
-안정 호버링 프리셋(권장):
+기본 SITL 실행:
 
 ```bash
-./launch_competition_sim.sh --sitl --images --hover-stable
+./launch_competition_sim.sh --sitl --images
 ```
 
 ArduSub(JSON)+QGroundControl 권장 실행 순서:
@@ -176,7 +182,7 @@ cd /home/khm/antigravity
 
 ```bash
 cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
-./launch_competition_sim.sh --sitl --images --hover-stable
+./launch_competition_sim.sh --sitl --images
 ```
 
 터미널 3 (QGC 영상 브리지, 선택):
@@ -280,11 +286,15 @@ docker run --rm -it --network host \
   - 시작 직후 몇 줄은 정상(시뮬레이터 연결 대기)
   - 5~10초 이상 계속 반복되면 비정상
   - MuJoCo를 반드시 `--sitl`로 실행해야 함:
-    - `./launch_competition_sim.sh --sitl --images --hover-stable`
+    - `./launch_competition_sim.sh --sitl --images`
+  - 현재 스크립트는 `--sitl` 또는 `--images`에 대해 `--ros2`를 자동으로 같이 활성화함
   - ArduSub는 `--model JSON`으로 실행되어야 함:
     - `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh`
   - JSON 포트 충돌 확인:
     - `ss -lupn | rg '9002|5760|14550'`
+- ROS2 publish callback이 바로 비활성화되는 경우
+  - `ROS2 callbacks disabled (SITL still active)` 로그는 ROS2 토픽이 잠깐 깨졌을 때만 표시될 수 있음
+  - SITL 모드에서는 9002 소켓 송신은 계속 유지되며, 하향 제어는 ArduSub JSON 경로를 통해 동작함
 - `DDS: No ping response, exiting`
   - DDS 미사용이면 무시 가능
   - 기본 실행 스크립트는 `DDS_ENABLE=0`으로 실행

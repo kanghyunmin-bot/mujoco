@@ -66,6 +66,11 @@ def main() -> None:
         help="Interactive joystick axis/sign/deadzone calibration and save to joystick_map.json",
     )
     parser.add_argument(
+        "--disable-joystick",
+        action="store_true",
+        help="Disable local Linux joystick input (ROS2 + terminal still active)",
+    )
+    parser.add_argument(
         "--calibrate-thrusters",
         action="store_true",
         help="Calibrate per-thruster gain_scale from single-thruster response and save to thruster_params.json",
@@ -1051,8 +1056,11 @@ def main() -> None:
     ):
         input_thread = threading.Thread(target=input_loop, daemon=True)
         input_thread.start()
-        joystick_thread = threading.Thread(target=joystick_loop, daemon=True)
-        joystick_thread.start()
+        if not args.disable_joystick:
+            joystick_thread = threading.Thread(target=joystick_loop, daemon=True)
+            joystick_thread.start()
+        else:
+            print("[runtime] Local joystick disabled by --disable-joystick", flush=True)
 
     # Thruster sets
     yaw_names = ["yaw_lf", "yaw_lr", "yaw_rf", "yaw_rr"]

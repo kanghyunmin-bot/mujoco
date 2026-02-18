@@ -587,6 +587,18 @@ class Ros2Bridge:
         # ROS2 context may be unavailable while SITL continues running.
         if not self._ros_ok:
             return
+
+        def _safe_publish(publisher, msg, label: str) -> bool:
+            try:
+                publisher.publish(msg)
+                return True
+            except Exception as exc:
+                if not self._ros_error_reported:
+                    self._ros_error_reported = True
+                    print(f"[ros2_bridge] ROS2 publish blocked ({label}): {exc}", flush=True)
+                self._ros_ok = False
+                return False
+
         try:
             stamp = self.node.get_clock().now().to_msg()
         except Exception as exc:
@@ -627,7 +639,8 @@ class Ros2Bridge:
                 imu.linear_acceleration_covariance[0] = 1e-2
                 imu.linear_acceleration_covariance[4] = 1e-2
                 imu.linear_acceleration_covariance[8] = 1e-2
-                self.pub_imu.publish(imu)
+                if not _safe_publish(self.pub_imu, imu, "/imu/data"):
+                    return
 
             # Publish DVL velocity
             if dvl_vel is not None:
@@ -637,7 +650,8 @@ class Ros2Bridge:
                 tw.twist.linear.x = float(dvl_vel[0])
                 tw.twist.linear.y = float(dvl_vel[1])
                 tw.twist.linear.z = float(dvl_vel[2])
-                self.pub_dvl_vel.publish(tw)
+                if not _safe_publish(self.pub_dvl_vel, tw, "/dvl/velocity"):
+                    return
 
             # Publish DVL altitude
             if dvl_alt is not None:
@@ -650,7 +664,8 @@ class Ros2Bridge:
                 rg.max_range = 30.0
                 rng = float(dvl_alt[0])
                 rg.range = float("inf") if rng < 0.0 else rng
-                self.pub_dvl_alt.publish(rg)
+                if not _safe_publish(self.pub_dvl_alt, rg, "/dvl/altitude"):
+                    return
 
             # Publish DVL Odometry (integrated from velocity)
             if dvl_vel is not None and quat is not None:
@@ -683,7 +698,8 @@ class Ros2Bridge:
                 odom.twist.twist.linear.x = float(dvl_vel[0])
                 odom.twist.twist.linear.y = float(dvl_vel[1])
                 odom.twist.twist.linear.z = float(dvl_vel[2])
-                self.pub_dvl_odom.publish(odom)
+                if not _safe_publish(self.pub_dvl_odom, odom, "/dvl/odometry"):
+                    return
 
             # Publish ground truth pose from MuJoCo
             if self._base_id >= 0:
@@ -700,7 +716,8 @@ class Ros2Bridge:
                 gt.pose.orientation.x = float(quat_mj[1])
                 gt.pose.orientation.y = float(quat_mj[2])
                 gt.pose.orientation.z = float(quat_mj[3])
-                self.pub_ground_truth.publish(gt)
+                if not _safe_publish(self.pub_ground_truth, gt, "/mujoco/ground_truth/pose"):
+                    return
 
         if self.publish_images and sim_t + 1e-9 >= self.next_image_t:
             self.next_image_t = sim_t + self.image_dt
@@ -719,11 +736,13 @@ class Ros2Bridge:
                 msg.is_bigendian = False
                 msg.step = int(img.shape[1] * 3)
                 msg.data = img.tobytes()
-                self.image_pubs[cname].publish(msg)
+                if not _safe_publish(self.image_pubs[cname], msg, f"/stereo/{cname}/image_raw"):
+                    return
 
                 info = self.cam_info[cname]
                 info.header.stamp = stamp
-                self.info_pubs[cname].publish(info)
+                if not _safe_publish(self.info_pubs[cname], info, f"/stereo/{cname}/camera_info"):
+                    return
 
     def reset_odometry(self) -> None:
         """Reset DVL odometry integration to zero."""
