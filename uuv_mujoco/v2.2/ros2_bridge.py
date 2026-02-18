@@ -38,6 +38,7 @@ class Ros2Bridge:
         enable_sitl: bool = False,
         sitl_ip: str = "127.0.0.1",
         sitl_port: int = 9002,
+        sitl_send_port: int = 9003,
         camera_calib_left: str = "",
         camera_calib_right: str = "",
     ) -> None:
@@ -104,11 +105,17 @@ class Ros2Bridge:
         self.enable_sitl = enable_sitl
         self.sitl_sock = None
         self.sitl_addr = (sitl_ip, int(sitl_port))
+        self.sitl_send_addr = (sitl_ip, int(sitl_send_port))
         self.sitl_listen_addr = ("0.0.0.0", int(sitl_port))
         self._sitl_client_addr = None
+        self._sitl_send_target = None
         self._sitl_client_last_wall = -1.0
         self._sitl_client_logged = False
         self._sitl_last_command_hz_log = time.monotonic()
+        self._sitl_last_send_wall = -1.0
+        self._sitl_last_send_err_wall = -1.0
+        self._sitl_last_no_client_wall = -1.0
+        self._sitl_send_counter = 0
         self._sitl_last_nonzero_cmd = None
         self._sitl_nonfinite_warned = False
         self._sitl_t0_wall = None
@@ -127,6 +134,8 @@ class Ros2Bridge:
             dtype=np.float64,
         )
         if self.enable_sitl:
+            if int(sitl_send_port) <= 0:
+                raise ValueError("sitl-send-port must be a positive integer")
             self._connect_sitl()
 
         # DVL odometry integration state
@@ -301,8 +310,9 @@ class Ros2Bridge:
             self.sitl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.sitl_sock.bind(self.sitl_listen_addr)
             self.sitl_sock.setblocking(False)
+            sock_addr = self.sitl_sock.getsockname()
             print(
-                f"[ros2_bridge] SITL socket initialized (listen {self.sitl_listen_addr}, default target {self.sitl_addr})",
+                f"[ros2_bridge] SITL socket initialized (listen {sock_addr}, default target {self.sitl_addr})",
                 flush=True,
             )
         except Exception as e:
@@ -327,11 +337,21 @@ class Ros2Bridge:
             magic = int.from_bytes(pkt[0:2], byteorder="little", signed=False)
             if magic not in (18458, 29569):
                 continue
-            self._sitl_client_addr = addr
+
+            if self._sitl_client_addr != addr:
+                if self._sitl_client_addr is None:
+                    print(f"[ros2_bridge] SITL servo endpoint discovered: {addr}", flush=True)
+                else:
+                    print(
+                        f"[ros2_bridge] SITL servo endpoint changed: "
+                        f"{self._sitl_client_addr} -> {addr}",
+                        flush=True,
+                    )
+                self._sitl_client_addr = addr
+                if not self._sitl_client_logged:
+                    self._sitl_client_logged = True
+
             self._sitl_client_last_wall = time.monotonic()
-            if not self._sitl_client_logged:
-                self._sitl_client_logged = True
-                print(f"[ros2_bridge] SITL servo endpoint discovered: {addr}", flush=True)
 
             # 16-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(16*2)
             # 32-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(32*2)
@@ -424,13 +444,47 @@ class Ros2Bridge:
                 print("[ros2_bridge] skip SITL packet: non-finite sensor value", flush=True)
             return
 
-        target = self._sitl_client_addr if self._sitl_client_addr is not None else self.sitl_addr
+        target = self._sitl_client_addr if self._sitl_client_addr is not None else self.sitl_send_addr
         try:
+            prev_target = self._sitl_send_target
             # ArduPilot JSON parser expects line-delimited JSON records.
             msg = (json.dumps(payload) + "\n").encode("utf-8")
-            self.sitl_sock.sendto(msg, target)
-        except Exception:
-            pass  # UDP fail is fine
+            sent = self.sitl_sock.sendto(msg, target)
+            self._sitl_send_counter += 1
+            self._sitl_send_target = target
+            now = time.monotonic()
+            if now - self._sitl_last_send_wall > 5.0:
+                if self._sitl_client_addr is None:
+                    print(
+                        f"[ros2_bridge] SITL send target still default (endpoint not discovered yet): {target} "
+                        f"packets_sent={self._sitl_send_counter}",
+                        flush=True,
+                    )
+                    self._sitl_last_no_client_wall = now
+                else:
+                    print(
+                        f"[ros2_bridge] SITL send ok (target={target}, bytes={sent}, packets_sent={self._sitl_send_counter})",
+                        flush=True,
+                    )
+                self._sitl_last_send_wall = now
+            if prev_target is not None and prev_target != target:
+                print(
+                    f"[ros2_bridge] SITL send target changed to servo source: {target}",
+                    flush=True,
+                )
+            if now - self._sitl_last_send_err_wall > 20.0:
+                if sent <= 0:
+                    print(
+                        f"[ros2_bridge] SITL send warning: sent {sent} bytes to {target}",
+                        flush=True,
+                    )
+                    self._sitl_last_send_err_wall = now
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self._sitl_last_send_err_wall > 2.0:
+                print(f"[ros2_bridge] SITL send failed to {target}: {exc}", flush=True)
+                self._sitl_last_send_err_wall = now
+            self._sitl_last_send_wall = now
 
 
     def _sensor_slice(self, name: str, data: mujoco.MjData) -> np.ndarray | None:

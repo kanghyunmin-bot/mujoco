@@ -18,6 +18,8 @@ IMAGES=""
 FORCE_ROS2=false
 HEADLESS_ARG=""
 SITL_ARG=""
+SITL_PORT="9002"
+SITL_SEND_PORT="9003"
 EXTRA_ARGS=()
 PROFILE=""
 HOVER_STABLE_REQUESTED=false
@@ -37,6 +39,22 @@ while [[ $# -gt 0 ]]; do
             SITL_ARG="--sitl"
             FORCE_ROS2=true
             shift
+            ;;
+        --sitl-port)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --sitl-port"
+                exit 2
+            fi
+            SITL_PORT="$2"
+            shift 2
+            ;;
+        --sitl-send-port)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --sitl-send-port"
+                exit 2
+            fi
+            SITL_SEND_PORT="$2"
+            shift 2
             ;;
         --hover-stable)
             HOVER_STABLE_REQUESTED=true
@@ -151,4 +169,6 @@ python3 run_urdf_full.py \
     $IMAGES $SITL_ARG $HEADLESS_ARG \
     --ros2-sensor-hz 50 \
     --ros2-image-hz 15 \
+    ${SITL_ARG:+--sitl-port "$SITL_PORT"} \
+    ${SITL_ARG:+--sitl-send-port "$SITL_SEND_PORT"} \
     "${EXTRA_ARGS[@]}"

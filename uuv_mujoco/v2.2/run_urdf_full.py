@@ -265,7 +265,13 @@ def main() -> None:
         "--sitl-port",
         type=int,
         default=9002,
-        help="ArduPilot SITL JSON interface Port",
+        help="ArduPilot SITL JSON servo recv/listen Port (ArduPilot sends servo packets here)",
+    )
+    parser.add_argument(
+        "--sitl-send-port",
+        type=int,
+        default=9003,
+        help="ArduPilot SITL JSON sensor send Port (ArduPilot expects JSON sensor packets here)",
     )
     parser.add_argument(
         "--headless",
@@ -1048,6 +1054,7 @@ def main() -> None:
                 enable_sitl=args.sitl,
                 sitl_ip=args.sitl_ip,
                 sitl_port=args.sitl_port,
+                sitl_send_port=args.sitl_send_port,
                 camera_calib_left=args.ros2_camera_calib_left,
                 camera_calib_right=args.ros2_camera_calib_right,
             )
