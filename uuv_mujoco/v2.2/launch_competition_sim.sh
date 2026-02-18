@@ -36,7 +36,9 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --hover-stable)
-            echo "[launch] --hover-stable option is no longer used; using default mission profile."
+            # Backward-compatibility alias: use hover-tuned profile.
+            EXTRA_ARGS+=("--profile" "sim_hover")
+            FORCE_ROS2=true
             shift
             ;;
         --calib-left)
