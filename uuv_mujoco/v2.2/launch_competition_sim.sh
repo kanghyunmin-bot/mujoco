@@ -20,6 +20,7 @@ HEADLESS_ARG=""
 SITL_ARG=""
 EXTRA_ARGS=()
 PROFILE=""
+HOVER_STABLE_REQUESTED=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --headless)
@@ -37,10 +38,15 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --hover-stable)
-            # Backward-compatible alias for legacy SITL behavior.
-            # Keeps existing strong stabilization and depth-hold behavior.
-            EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
-            PROFILE="sim_hover"
+            HOVER_STABLE_REQUESTED=true
+            # Backward-compatible alias for legacy non-SITL behavior.
+            # In SITL, stability is delegated to ArduPilot/QGC.
+            if [[ -n "$SITL_ARG" ]]; then
+                echo "[launch] Note: --hover-stable is ignored in --sitl mode."
+            else
+                EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
+                PROFILE="sim_hover"
+            fi
             FORCE_ROS2=true
             shift
             ;;
@@ -108,6 +114,22 @@ if [ "$FORCE_ROS2" = true ]; then
             EXTRA_ARGS+=("--profile" "$PROFILE")
         fi
     fi
+fi
+
+if [[ "$HOVER_STABLE_REQUESTED" == true && -n "$SITL_ARG" && -n "$PROFILE" && "$PROFILE" == "sim_hover" ]]; then
+    PROFILE="sim_real"
+    for idx in "${!EXTRA_ARGS[@]}"; do
+        if [[ "${EXTRA_ARGS[$idx]}" == "--profile" ]]; then
+            if ((idx + 1 < ${#EXTRA_ARGS[@]})); then
+                unset 'EXTRA_ARGS[idx]'
+                unset 'EXTRA_ARGS[idx+1]'
+                break
+            fi
+        fi
+    done
+    EXTRA_ARGS=("${EXTRA_ARGS[@]}")
+    EXTRA_ARGS+=(--profile "$PROFILE")
+    echo "[launch] Note: --hover-stable + --sitl combination uses sim_real with no internal stabilization."
 fi
 
 if [[ -n "$PROFILE" && "$PROFILE" != "sim_real" ]]; then

@@ -1183,6 +1183,16 @@ def main() -> None:
         raw = depth_hold_kp * err + depth_hold_kd * z_rate_world + depth_hold_ki * depth_hold_int["value"]
         return float(np.clip(raw, -depth_hold_cmd_max, depth_hold_cmd_max))
 
+    if args.sitl:
+        if args.imu_stabilize or args.depth_hold:
+            print(
+                "[simulation] SITL mode: internal stabilization/depth-hold are disabled; "
+                "control authority is delegated to ArduPilot.",
+                flush=True,
+            )
+        args.imu_stabilize = False
+        args.depth_hold = False
+
     imu_stabilize_active = {"value": bool(args.imu_stabilize)}
     imu_stab_kp = float(args.imu_stab_kp)
     imu_stab_kd = float(args.imu_stab_kd)
