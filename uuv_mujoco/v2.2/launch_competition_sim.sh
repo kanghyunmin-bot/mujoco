@@ -21,6 +21,7 @@ SITL_ARG=""
 EXTRA_ARGS=()
 PROFILE=""
 HOVER_STABLE_REQUESTED=false
+ALLOW_LOCAL_JOYSTICK=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --headless)
@@ -48,6 +49,10 @@ while [[ $# -gt 0 ]]; do
                 PROFILE="sim_hover"
             fi
             FORCE_ROS2=true
+            shift
+            ;;
+        --allow-local-joystick)
+            ALLOW_LOCAL_JOYSTICK=true
             shift
             ;;
         --profile)
@@ -112,6 +117,11 @@ if [ "$FORCE_ROS2" = true ]; then
         if [[ -z "$PROFILE" ]]; then
             PROFILE="sim_real"
             EXTRA_ARGS+=("--profile" "$PROFILE")
+        fi
+        if [[ "$ALLOW_LOCAL_JOYSTICK" == false ]]; then
+            # Prevent accidental local joystick noise from overriding SITL inputs.
+            EXTRA_ARGS+=("--disable-joystick")
+            echo "[launch] SITL mode: local /dev/input joystick disabled (use --allow-local-joystick to override)."
         fi
     fi
 fi

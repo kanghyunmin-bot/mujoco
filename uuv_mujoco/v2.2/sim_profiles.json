@@ -20,7 +20,7 @@
   },
   "sim_real": {
     "half_height": 0.147,
-    "buoyancy_scale": 1.002,
+    "buoyancy_scale": 0.999,
     "cob_torque_scale": 1.0,
     "buoyancy_point_blend": 1.0,
     "align_com_to_thruster_plane": false,
