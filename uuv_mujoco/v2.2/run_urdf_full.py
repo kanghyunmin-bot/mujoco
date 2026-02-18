@@ -130,6 +130,59 @@ def main() -> None:
         help="Max integral term (rad*s)",
     )
     parser.add_argument(
+        "--depth-hold",
+        action="store_true",
+        help="Enable simple depth hold (z-axis hold) using vertical thrusters",
+    )
+    parser.add_argument(
+        "--depth-hold-target-z",
+        type=float,
+        default=None,
+        help="Target world z depth for hold (default: first measured depth)",
+    )
+    parser.add_argument(
+        "--depth-hold-kp",
+        type=float,
+        default=3.5,
+        help="Depth hold proportional gain",
+    )
+    parser.add_argument(
+        "--depth-hold-kd",
+        type=float,
+        default=1.2,
+        help="Depth hold derivative gain",
+    )
+    parser.add_argument(
+        "--depth-hold-ki",
+        type=float,
+        default=0.05,
+        help="Depth hold integral gain",
+    )
+    parser.add_argument(
+        "--depth-hold-int-max",
+        type=float,
+        default=0.6,
+        help="Depth hold integral clamp",
+    )
+    parser.add_argument(
+        "--depth-hold-cmd-max",
+        type=float,
+        default=0.75,
+        help="Max normalized depth-hold command before combining with user heave",
+    )
+    parser.add_argument(
+        "--depth-hold-user-deadband",
+        type=float,
+        default=0.05,
+        help="If abs(user heave) is below this, depth hold can be applied",
+    )
+    parser.add_argument(
+        "--depth-hold-deadband",
+        type=float,
+        default=0.02,
+        help="Deadband on depth error (m) for depth hold",
+    )
+    parser.add_argument(
         "--profile",
         type=str,
         default="sim_real",
@@ -1078,6 +1131,47 @@ def main() -> None:
         imu_stab_cache["tau_body"] = tau_body
         imu_stab_cache["tau_world"] = base_rot @ tau_body
 
+    def update_depth_hold(dt: float, user_heave_cmd: float) -> float:
+        """Estimate depth error and generate normalized heave correction."""
+        if (
+            not depth_hold_active["value"]
+            or dt <= 1e-9
+            or not np.isfinite(depth_hold_kp)
+            or not np.isfinite(depth_hold_kd)
+            or not np.isfinite(depth_hold_ki)
+        ):
+            return 0.0
+
+        if abs(float(user_heave_cmd)) > depth_hold_user_deadband:
+            depth_hold_int["value"] = 0.0
+            return 0.0
+
+        if depth_hold_target_z["value"] is None:
+            depth_hold_target_z["value"] = float(data.xipos[base_id][2]) if args.depth_hold_target_z is None else float(args.depth_hold_target_z)
+        target_z = float(depth_hold_target_z["value"])
+        if not np.isfinite(target_z):
+            depth_hold_target_z["value"] = float(data.xipos[base_id][2])
+            target_z = depth_hold_target_z["value"]
+
+        err = float(data.xipos[base_id][2] - target_z)
+        if abs(err) <= depth_hold_error_deadband:
+            depth_hold_int["value"] *= 0.9
+            err = 0.0
+        else:
+            depth_hold_int["value"] += err * dt
+
+        depth_hold_int["value"] = float(
+            np.clip(depth_hold_int["value"], -depth_hold_int_max, depth_hold_int_max)
+        )
+
+        # Coordinate convention:
+        # world z-axis is up, and positive vertical thruster command pushes down.
+        # z_err > 0 -> robot is too shallow, so push down (+);
+        # z_err < 0 -> robot is too deep, so pull up (-).
+        z_rate_world = float(data.cvel[base_id, 5])
+        raw = depth_hold_kp * err + depth_hold_kd * z_rate_world + depth_hold_ki * depth_hold_int["value"]
+        return float(np.clip(raw, -depth_hold_cmd_max, depth_hold_cmd_max))
+
     imu_stabilize_active = {"value": bool(args.imu_stabilize)}
     imu_stab_kp = float(args.imu_stab_kp)
     imu_stab_kd = float(args.imu_stab_kd)
@@ -1088,6 +1182,18 @@ def main() -> None:
     imu_stab_int = np.zeros(3, dtype=np.float64)
     imu_stab_cache = {"tau_body": np.zeros(3, dtype=np.float64), "tau_world": np.zeros(3, dtype=np.float64)}
     yaw_cmd_for_stab = {"value": 0.0}
+
+    depth_hold_active = {"value": bool(args.depth_hold)}
+    depth_hold_target_z = {"value": None}
+    depth_hold_int = {"value": 0.0}
+    depth_hold_kp = float(args.depth_hold_kp)
+    depth_hold_kd = float(args.depth_hold_kd)
+    depth_hold_ki = float(args.depth_hold_ki)
+    depth_hold_int_max = float(args.depth_hold_int_max)
+    depth_hold_cmd_max = float(np.clip(args.depth_hold_cmd_max, 0.05, 1.0))
+    depth_hold_user_deadband = float(args.depth_hold_user_deadband)
+    depth_hold_error_deadband = float(args.depth_hold_deadband)
+    depth_hold_target_z["value"] = args.depth_hold_target_z
 
     def ensure_tune_file() -> None:
         if tune_path.exists():
@@ -1984,7 +2090,8 @@ def main() -> None:
             fwd_cmd = np.clip(forward / cmd_scale, -1.0, 1.0)
             sway_cmd = np.clip(sway / cmd_scale, -1.0, 1.0)
             yaw_cmd = np.clip(yaw / cmd_scale, -1.0, 1.0)
-            heave_cmd = np.clip(heave / cmd_scale, -1.0, 1.0)
+            depth_hold_cmd = update_depth_hold(model.opt.timestep, heave)
+            heave_cmd = np.clip((heave + depth_hold_cmd * cmd_scale) / cmd_scale, -1.0, 1.0)
             yaw_cmd_for_stab["value"] = abs(float(yaw_cmd))
 
             horiz_cmd = mix_horizontal_thrusters(fwd_cmd, sway_cmd, yaw_cmd)
@@ -2009,11 +2116,15 @@ def main() -> None:
             yaw_cmd_for_stab["value"] = 0.0
             if imu_stabilize_active["value"]:
                 update_stabilization(model.opt.timestep)
+            depth_hold_cmd = update_depth_hold(model.opt.timestep, 0.0)
+            depth_hold_cmd_for_thrusters = depth_hold_cmd
+            for name in all_thruster_names:
+                thr_target[name] = 0.0
             if imu_stabilize_active["value"] and imu_stab_mode in ("thrusters", "both"):
-                for name in all_thruster_names:
-                    thr_target[name] = 0.0
                 apply_stabilization_thrusters()
-                update_thruster_forces(model.opt.timestep)
+            for name in ver_names:
+                thr_target[name] = float(np.clip(thr_target[name] + depth_hold_cmd_for_thrusters, -1.0, 1.0))
+            update_thruster_forces(model.opt.timestep)
             update_propeller_visuals(model.opt.timestep if not is_paused else 0.0)
 
         apply_underwater_wrench(model.opt.timestep if not is_paused else 0.0)

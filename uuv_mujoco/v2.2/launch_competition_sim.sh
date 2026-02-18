@@ -65,11 +65,17 @@ if [ "$HOVER_STABLE" = true ]; then
     EXTRA_ARGS+=(
         "--profile" "sim_hover"
         "--imu-stabilize"
+        "--depth-hold"
         "--imu-stab-mode" "both"
         "--imu-stab-kp" "6.8"
         "--imu-stab-kd" "2.2"
         "--imu-stab-ki" "0.2"
         "--imu-stab-max" "8.5"
+        "--depth-hold-kp" "2.6"
+        "--depth-hold-kd" "1.0"
+        "--depth-hold-ki" "0.03"
+        "--depth-hold-cmd-max" "0.7"
+        "--depth-hold-user-deadband" "0.03"
     )
 fi
 
