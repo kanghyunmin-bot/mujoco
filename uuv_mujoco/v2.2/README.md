@@ -282,6 +282,9 @@ docker run --rm -it --network host \
   - 자동연결이 안되면 `Application Settings > Comm Links`에서 수동 추가
   - 권장: `UDP`, `Port=14550`
   - 대체: `TCP`, `Server=127.0.0.1`, `Port=5760`
+  - ArduSub 실행 스크립트와 포트 일치 확인:
+    - QGC 기본 `14550`은 `run_ardusub_json_sitl.sh` 기본 `--qgc-port`와 매칭되어야 함.
+    - TCP를 쓰려면 스크립트 실행 시 `--qgc-link tcpclient --qgc-port 5760` 사용 가능
 - `No JSON sensor message received, resending servos`
   - 시작 직후 몇 줄은 정상(시뮬레이터 연결 대기)
   - 5~10초 이상 계속 반복되면 비정상
@@ -289,9 +292,20 @@ docker run --rm -it --network host \
     - `./launch_competition_sim.sh --sitl --images`
   - 현재 스크립트는 `--sitl` 또는 `--images`에 대해 `--ros2`를 자동으로 같이 활성화함
   - ArduSub는 `--model JSON`으로 실행되어야 함:
-    - `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh`
+  - `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh`
+  - QGC 링크 타입을 강제하려면:
+    - UDP: `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --qgc-link udpclient --qgc-port 14550`
+    - TCP: `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --qgc-link tcpclient --qgc-port 5760`
   - JSON 포트 충돌 확인:
     - `ss -lupn | rg '9002|5760|14550'`
+- ArduPilot이 QGC를 못 받는지 확인:
+  - 시뮬 시작 후 1초 내에 아래 로그가 보이면 정상:
+    - ArduSub: `[SIM]` 또는 `Connecting to` 계열 시작 로그
+    - MuJoCo 브릿지: `[ros2_bridge] SITL socket initialized`
+    - MuJoCo 브릿지: `[ros2_bridge] SITL servo endpoint discovered`
+  - 안 보이면 포트 점유/방화벽/다른 QGC 인스턴스를 점검:
+    - `ss -lupn | rg '14550|5760|9002|9003'`
+    - `pkill -f "QGroundControl|run_ardusub_json_sitl|sim_vehicle.py"`
 - ROS2 publish callback이 바로 비활성화되는 경우
   - `ROS2 callbacks disabled (SITL still active)` 로그는 ROS2 토픽이 잠깐 깨졌을 때만 표시될 수 있음
   - SITL 모드에서는 9002 소켓 송신은 계속 유지되며, 하향 제어는 ArduSub JSON 경로를 통해 동작함

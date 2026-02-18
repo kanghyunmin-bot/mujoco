@@ -111,6 +111,9 @@ class Ros2Bridge:
         self._sitl_send_target = None
         self._sitl_client_last_wall = -1.0
         self._sitl_client_logged = False
+        self._sitl_no_client_warn_interval_s = 3.0
+        self._sitl_last_client_missing_wall = -1.0
+        self._sitl_last_command_stale_wall = -1.0
         self._sitl_last_command_hz_log = time.monotonic()
         self._sitl_last_send_wall = -1.0
         self._sitl_last_send_err_wall = -1.0
@@ -322,6 +325,9 @@ class Ros2Bridge:
         """Poll incoming ArduPilot servo packets and apply as control input."""
         if not self.sitl_sock:
             return
+
+        now_wall = time.monotonic()
+        got_any = False
         while True:
             try:
                 pkt, addr = self.sitl_sock.recvfrom(2048)
@@ -351,7 +357,9 @@ class Ros2Bridge:
                 if not self._sitl_client_logged:
                     self._sitl_client_logged = True
 
-            self._sitl_client_last_wall = time.monotonic()
+                self._sitl_client_last_wall = time.monotonic()
+                self._sitl_last_command_stale_wall = -1.0
+                got_any = True
 
             # 16-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(16*2)
             # 32-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(32*2)
@@ -381,8 +389,28 @@ class Ros2Bridge:
                         flush=True,
                     )
                     self._sitl_last_command_hz_log = now
-                self._sitl_last_nonzero_cmd = (fwd, sway, yaw, heave)
+                    self._sitl_last_nonzero_cmd = (fwd, sway, yaw, heave)
             self._handle_normalized_cmd(fwd, sway, yaw, heave)
+
+        # Emit clear warnings when ArduPilot hasn't started sending servo packets yet.
+        # In connected operation, this means QGC is not forwarding manual RC input.
+        now_wall = time.monotonic()
+        if self._sitl_client_addr is None:
+            if now_wall - self._sitl_last_client_missing_wall >= self._sitl_no_client_warn_interval_s:
+                print(
+                    f"[ros2_bridge] Waiting for SITL servo packets on {self.sitl_addr} "
+                    "(QGC must be connected and in GUIDED/ArduPilot manual mode).",
+                    flush=True,
+                )
+                self._sitl_last_client_missing_wall = now_wall
+        elif self._sitl_client_last_wall > 0.0 and now_wall - self._sitl_client_last_wall >= self._sitl_no_client_warn_interval_s:
+            if now_wall - self._sitl_last_command_stale_wall >= self._sitl_no_client_warn_interval_s:
+                print(
+                    f"[ros2_bridge] No new SITL servo packets for {now_wall - self._sitl_client_last_wall:.1f}s "
+                    f"from {self._sitl_client_addr}",
+                    flush=True,
+                )
+                self._sitl_last_command_stale_wall = now_wall
 
     def _send_sitl_data(self, t: float, gyro: np.ndarray, acc: np.ndarray, vel: np.ndarray, pos: np.ndarray, quat: np.ndarray) -> None:
         """Send JSON packet to ArduPilot SITL."""
