@@ -12,6 +12,7 @@ Responsibilities:
 import json
 import os
 import socket
+import struct
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -107,6 +108,8 @@ class Ros2Bridge:
         self._sitl_client_addr = None
         self._sitl_client_last_wall = -1.0
         self._sitl_client_logged = False
+        self._sitl_last_command_hz_log = time.monotonic()
+        self._sitl_last_nonzero_cmd = None
         self._sitl_nonfinite_warned = False
         self._sitl_t0_wall = None
         # Frame conversion:
@@ -306,7 +309,7 @@ class Ros2Bridge:
             print(f"[ros2_bridge] Failed to init SITL socket: {e}", flush=True)
 
     def _poll_sitl_servo_endpoint(self) -> None:
-        """Poll incoming ArduPilot servo packets and remember source endpoint."""
+        """Poll incoming ArduPilot servo packets and apply as control input."""
         if not self.sitl_sock:
             return
         while True:
@@ -316,16 +319,50 @@ class Ros2Bridge:
                 break
             except Exception:
                 break
+
             # Expected binary packet starts with uint16 magic:
-            # 18458 (16ch) or 29569 (32ch). We only need source endpoint here.
-            if len(pkt) >= 8:
-                magic = int.from_bytes(pkt[0:2], byteorder="little", signed=False)
-                if magic in (18458, 29569):
-                    self._sitl_client_addr = addr
-                    self._sitl_client_last_wall = time.monotonic()
-                    if not self._sitl_client_logged:
-                        self._sitl_client_logged = True
-                        print(f"[ros2_bridge] SITL servo endpoint discovered: {addr}", flush=True)
+            # 18458 (16ch) or 29569 (32ch).
+            if len(pkt) < 8:
+                continue
+            magic = int.from_bytes(pkt[0:2], byteorder="little", signed=False)
+            if magic not in (18458, 29569):
+                continue
+            self._sitl_client_addr = addr
+            self._sitl_client_last_wall = time.monotonic()
+            if not self._sitl_client_logged:
+                self._sitl_client_logged = True
+                print(f"[ros2_bridge] SITL servo endpoint discovered: {addr}", flush=True)
+
+            # 16-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(16*2)
+            # 32-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(32*2)
+            frame_size = 2 + 2 + 4 + (16 * 2 if magic == 18458 else 32 * 2)
+            if len(pkt) < frame_size:
+                continue
+            try:
+                pwm_values = list(struct.unpack_from("<16H" if magic == 18458 else "<32H", pkt, 8))
+            except struct.error:
+                continue
+
+            if len(pwm_values) <= max(self._ch_forward, self._ch_lateral, self._ch_throttle, self._ch_yaw):
+                continue
+
+            fwd = self._pwm_to_normalized(int(pwm_values[self._ch_forward]))
+            sway = self._pwm_to_normalized(int(pwm_values[self._ch_lateral]))
+            heave = self._pwm_to_normalized(int(pwm_values[self._ch_throttle]))
+            yaw = self._pwm_to_normalized(int(pwm_values[self._ch_yaw]))
+            nonzero = abs(fwd) > 0.01 or abs(sway) > 0.01 or abs(heave) > 0.01 or abs(yaw) > 0.01
+            if nonzero:
+                now = time.monotonic()
+                if self._sitl_last_nonzero_cmd is None or now - self._sitl_last_command_hz_log > 2.0:
+                    print(
+                        "[ros2_bridge] SITL servo input: "
+                        f"ch[{self._ch_forward},{self._ch_lateral},{self._ch_throttle},{self._ch_yaw}]="
+                        f"{fwd:+.3f},{sway:+.3f},{heave:+.3f},{yaw:+.3f}",
+                        flush=True,
+                    )
+                    self._sitl_last_command_hz_log = now
+                self._sitl_last_nonzero_cmd = (fwd, sway, yaw, heave)
+            self._handle_normalized_cmd(fwd, sway, yaw, heave)
 
     def _send_sitl_data(self, t: float, gyro: np.ndarray, acc: np.ndarray, vel: np.ndarray, pos: np.ndarray, quat: np.ndarray) -> None:
         """Send JSON packet to ArduPilot SITL."""
