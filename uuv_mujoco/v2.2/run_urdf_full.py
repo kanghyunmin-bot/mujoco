@@ -627,10 +627,18 @@ def main() -> None:
     follow_camera_init = {"value": False}
     show_sensor_overlay = {"value": True}
     camera_mode = {"value": "free"}  # free | follow | stereo_left | stereo_right
+    # Local input defaults (keyboard/joystick) are intentionally mapped to this frame.
     heave_sign = -1.0
     forward_sign = 1.0
     yaw_sign = 1.0
     sway_sign = -1.0
+    # Track last command source to avoid re-applying local frame mapping to SITL/ROS2 cmd streams.
+    cmd_source = {"value": "remote"}
+
+    def set_cmd_source(source: str) -> None:
+        if source not in ("local", "remote"):
+            return
+        cmd_source["value"] = source
 
     joy_map = {
         "axes": {
@@ -663,6 +671,7 @@ def main() -> None:
             yaw = cmd["yaw"]
             heave = cmd["heave"]
             step = state["step"]
+            source = cmd_source["value"]
         paused = paused_flag["value"]
         mode = "viewer" if viewer_control_mode["value"] else "terminal"
         labels = "on" if show_thruster_labels["value"] else "off"
@@ -670,11 +679,13 @@ def main() -> None:
         cam_mode = camera_mode["value"]
         sway = cmd["sway"]
         print(
-            f"[cmd] fwd={forward:+.1f} sway={sway:+.1f} yaw={yaw:+.1f} heave={heave:+.1f} step={step:.1f} paused={paused} mode={mode} labels={labels} sensors={sensors} cam={cam_mode}",
+            f"[cmd] src={source} fwd={forward:+.1f} sway={sway:+.1f} yaw={yaw:+.1f} heave={heave:+.1f} "
+            f"step={step:.1f} paused={paused} mode={mode} labels={labels} sensors={sensors} cam={cam_mode}",
             flush=True,
         )
 
     def apply_key(ch: str) -> None:
+        set_cmd_source("local")
         with cmd_lock:
             step = state["step"]
             max_val = state["max"]
@@ -722,6 +733,7 @@ def main() -> None:
         show_sensor_overlay["value"] = not show_sensor_overlay["value"]
 
     def apply_ros_cmd(forward: float, sway: float, yaw: float, heave: float) -> None:
+        set_cmd_source("remote")
         with cmd_lock:
             max_val = state["max"]
             cmd["forward"] = clamp(forward, max_val)
@@ -813,6 +825,7 @@ def main() -> None:
                 float(axis_sign["heave"]) * shape_axis(heave_axis) * max_val,
                 max_val,
             )
+        set_cmd_source("local")
 
     def joystick_loop() -> None:
         """Read Linux joystick events and stream commands into the control state."""
@@ -1187,10 +1200,13 @@ def main() -> None:
                 with cmd_lock:
                     max_val = state["max"]
                     if target in ("fwd", "forward"):
+                        set_cmd_source("local")
                         cmd["forward"] = clamp(value, max_val)
                     elif target in ("yaw",):
+                        set_cmd_source("local")
                         cmd["yaw"] = clamp(value, max_val)
                     elif target in ("heave", "z"):
+                        set_cmd_source("local")
                         cmd["heave"] = clamp(value, max_val)
                     else:
                         print("Unknown set target. Use fwd, yaw, heave.", flush=True)
@@ -2330,10 +2346,17 @@ def main() -> None:
         if not viewer_control_mode["value"]:
             # Manual commands
             with cmd_lock:
-                forward = forward_sign * cmd["forward"]
-                heave = heave_sign * cmd["heave"]
-                yaw = yaw_sign * cmd["yaw"]
-                sway = sway_sign * cmd["sway"]
+                source = cmd_source["value"]
+                if source == "local":
+                    forward = forward_sign * cmd["forward"]
+                    heave = heave_sign * cmd["heave"]
+                    yaw = yaw_sign * cmd["yaw"]
+                    sway = sway_sign * cmd["sway"]
+                else:
+                    forward = cmd["forward"]
+                    heave = cmd["heave"]
+                    yaw = cmd["yaw"]
+                    sway = cmd["sway"]
 
             # Reload tuning if file changed
             if tune_path.exists():
