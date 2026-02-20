@@ -292,6 +292,65 @@ def main() -> None:
         help="ArduPilot SITL JSON sensor send Port (ArduPilot expects JSON sensor packets here)",
     )
     parser.add_argument(
+        "--sitl-rc-ch-forward",
+        type=int,
+        default=1,
+        help="SITL RC channel index for forward/pitch axis (0-based).",
+    )
+    parser.add_argument(
+        "--sitl-rc-ch-lateral",
+        type=int,
+        default=0,
+        help="SITL RC channel index for lateral/roll axis (0-based).",
+    )
+    parser.add_argument(
+        "--sitl-rc-ch-throttle",
+        type=int,
+        default=2,
+        help="SITL RC channel index for heave/throttle axis (0-based).",
+    )
+    parser.add_argument(
+        "--sitl-rc-ch-yaw",
+        type=int,
+        default=3,
+        help="SITL RC channel index for yaw axis (0-based).",
+    )
+    parser.add_argument(
+        "--sitl-forward-sign",
+        type=float,
+        default=1.0,
+        help="Sign multiplier for SITL forward axis input.",
+    )
+    parser.add_argument(
+        "--sitl-lateral-sign",
+        type=float,
+        default=1.0,
+        help="Sign multiplier for SITL lateral axis input.",
+    )
+    parser.add_argument(
+        "--sitl-yaw-sign",
+        type=float,
+        default=1.0,
+        help="Sign multiplier for SITL yaw axis input.",
+    )
+    parser.add_argument(
+        "--sitl-heave-sign",
+        type=float,
+        default=1.0,
+        help="Sign multiplier for SITL heave axis input.",
+    )
+    parser.add_argument(
+        "--sitl-cmd-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for SITL command amplitude (0.0~1.0 recommended).",
+    )
+    parser.add_argument(
+        "--sitl-command-debug",
+        action="store_true",
+        help="Print SITL channel->command conversion diagnostics.",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run real-time simulation loop without GLFW viewer",
@@ -1173,6 +1232,16 @@ def main() -> None:
                 sitl_ip=args.sitl_ip,
                 sitl_port=args.sitl_port,
                 sitl_send_port=args.sitl_send_port,
+                sitl_ch_forward=int(args.sitl_rc_ch_forward),
+                sitl_ch_lateral=int(args.sitl_rc_ch_lateral),
+                sitl_ch_throttle=int(args.sitl_rc_ch_throttle),
+                sitl_ch_yaw=int(args.sitl_rc_ch_yaw),
+                sitl_forward_sign=float(args.sitl_forward_sign),
+                sitl_lateral_sign=float(args.sitl_lateral_sign),
+                sitl_yaw_sign=float(args.sitl_yaw_sign),
+                sitl_heave_sign=float(args.sitl_heave_sign),
+                sitl_cmd_scale=float(args.sitl_cmd_scale),
+                sitl_command_debug=bool(args.sitl_command_debug),
                 camera_calib_left=args.ros2_camera_calib_left,
                 camera_calib_right=args.ros2_camera_calib_right,
                 enable_ros=enable_ros2,

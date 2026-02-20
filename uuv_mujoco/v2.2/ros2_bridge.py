@@ -39,6 +39,16 @@ class Ros2Bridge:
         sitl_ip: str = "127.0.0.1",
         sitl_port: int = 9002,
         sitl_send_port: int = 9003,
+        sitl_ch_forward: int = 1,
+        sitl_ch_lateral: int = 0,
+        sitl_ch_throttle: int = 2,
+        sitl_ch_yaw: int = 3,
+        sitl_forward_sign: float = 1.0,
+        sitl_lateral_sign: float = 1.0,
+        sitl_yaw_sign: float = 1.0,
+        sitl_heave_sign: float = 1.0,
+        sitl_cmd_scale: float = 1.0,
+        sitl_command_debug: bool = False,
         camera_calib_left: str = "",
         camera_calib_right: str = "",
         enable_ros: bool = True,
@@ -140,6 +150,21 @@ class Ros2Bridge:
         self._sitl_last_nonzero_cmd = None
         self._sitl_nonfinite_warned = False
         self._sitl_t0_wall = None
+        self._sitl_cmd_debug = bool(sitl_command_debug)
+        self._sitl_last_cmd_log = -1.0
+        self._sitl_last_cmd_nonzero = None
+        self._sitl_cmd_scale = max(0.0, float(sitl_cmd_scale))
+        self._sitl_cmd_sign = np.array(
+            [
+                float(sitl_forward_sign),
+                float(sitl_lateral_sign),
+                float(sitl_yaw_sign),
+                float(sitl_heave_sign),
+            ],
+            dtype=np.float64,
+        )
+        self._sitl_cmd_sign = np.where(np.isfinite(self._sitl_cmd_sign), self._sitl_cmd_sign, 1.0)
+        self._sitl_cmd_sign[np.isclose(self._sitl_cmd_sign, 0.0)] = 1.0
         # Frame conversion:
         # - MuJoCo world is treated as ENU-like (z-up).
         # - ArduPilot JSON expects NED world and FRD body vectors.
@@ -194,15 +219,33 @@ class Ros2Bridge:
         self._pwm_neutral = 1500
         # MAVLink RC input order is Roll(1), Pitch(2), Throttle(3), Yaw(4).
         # Zero-based indices are used below.
-        self._ch_forward = self._env_to_int("ROS2_UUV_RC_CH_FORWARD", 1)
-        self._ch_lateral = self._env_to_int("ROS2_UUV_RC_CH_LATERAL", 0)
-        self._ch_throttle = self._env_to_int("ROS2_UUV_RC_CH_THROTTLE", 2)
-        self._ch_yaw = self._env_to_int("ROS2_UUV_RC_CH_YAW", 3)
+        self._ch_forward = self._env_to_int("ROS2_UUV_RC_CH_FORWARD", int(sitl_ch_forward))
+        self._ch_lateral = self._env_to_int("ROS2_UUV_RC_CH_LATERAL", int(sitl_lateral))
+        self._ch_throttle = self._env_to_int("ROS2_UUV_RC_CH_THROTTLE", int(sitl_throttle))
+        self._ch_yaw = self._env_to_int("ROS2_UUV_RC_CH_YAW", int(sitl_yaw))
+        # Optional SITL environment overrides for command sign/scale (kept compatible
+        # with CLI args above for easier calibration while debugging).
+        self._sitl_cmd_sign = np.array(
+            [
+                self._env_to_float("ROS2_UUV_SITL_FORWARD_SIGN", float(sitl_cmd_sign[0])),
+                self._env_to_float("ROS2_UUV_SITL_LATERAL_SIGN", float(sitl_cmd_sign[1])),
+                self._env_to_float("ROS2_UUV_SITL_YAW_SIGN", float(sitl_cmd_sign[2])),
+                self._env_to_float("ROS2_UUV_SITL_HEAVE_SIGN", float(sitl_cmd_sign[3])),
+            ],
+            dtype=np.float64,
+        )
+        self._sitl_cmd_sign = np.where(np.isfinite(self._sitl_cmd_sign), self._sitl_cmd_sign, 1.0)
+        self._sitl_cmd_sign[np.isclose(self._sitl_cmd_sign, 0.0)] = 1.0
+        sitl_cmd_scale_env = self._env_to_float(
+            "ROS2_UUV_SITL_CMD_SCALE", float(self._sitl_cmd_scale)
+        )
+        self._sitl_cmd_scale = float(np.clip(sitl_cmd_scale_env, 0.0, 2.0))
         if self._enable_ros:
             self.node.get_logger().info(
                 f"Using MAVLink RC override channel map: "
                 f"forward={self._ch_forward}, lateral={self._ch_lateral}, "
-                f"throttle={self._ch_throttle}, yaw={self._ch_yaw}"
+                f"throttle={self._ch_throttle}, yaw={self._ch_yaw}, "
+                f"SITL_sign={self._sitl_cmd_sign.tolist()}, SITL_scale={self._sitl_cmd_scale:.3f}"
             )
 
         self.model = model
@@ -286,6 +329,32 @@ class Ros2Bridge:
             print(f"[ros2_bridge] invalid {env_name}={value!r}, using {default}", flush=True)
             return default
         return max(0, parsed)
+
+    @staticmethod
+    def _env_to_float(env_name: str, default: float) -> float:
+        value = os.getenv(env_name)
+        if not value:
+            return float(default)
+        try:
+            parsed = float(value)
+        except ValueError:
+            print(f"[ros2_bridge] invalid {env_name}={value!r}, using {default}", flush=True)
+            return float(default)
+        return float(parsed)
+
+    def _sitl_map_and_scale(self, fwd: float, sway: float, yaw: float, heave: float) -> tuple[float, float, float, float]:
+        """Apply SITL axis sign and gain settings."""
+        vec = np.array([fwd, sway, yaw, heave], dtype=np.float64)
+        if not np.all(np.isfinite(vec)):
+            vec = np.nan_to_num(vec, nan=0.0, posinf=1.0, neginf=-1.0)
+        mapped = vec * self._sitl_cmd_sign * self._sitl_cmd_scale
+        mapped = np.clip(mapped, -1.0, 1.0)
+        return (
+            float(mapped[0]),
+            float(mapped[1]),
+            float(mapped[2]),
+            float(mapped[3]),
+        )
 
     def _handle_normalized_cmd(
         self,
@@ -406,6 +475,20 @@ class Ros2Bridge:
             sway = self._pwm_to_normalized(int(pwm_values[self._ch_lateral]))
             heave = self._pwm_to_normalized(int(pwm_values[self._ch_throttle]))
             yaw = self._pwm_to_normalized(int(pwm_values[self._ch_yaw]))
+            raw_fwd, raw_sway, raw_yaw, raw_heave = fwd, sway, yaw, heave
+            fwd, sway, yaw, heave = self._sitl_map_and_scale(fwd, sway, yaw, heave)
+            if self._sitl_cmd_debug and (self._sitl_last_cmd_nonzero != (fwd, sway, yaw, heave)):
+                now = time.monotonic()
+                if now - self._sitl_last_cmd_log > 0.15:
+                    print(
+                        "[ros2_bridge] SITL raw->mapped pwm: "
+                        f"raw({pwm_values[self._ch_forward]},{pwm_values[self._ch_lateral]},{pwm_values[self._ch_throttle]},{pwm_values[self._ch_yaw]}) => "
+                        f"norm({raw_fwd:+.3f},{raw_sway:+.3f},{raw_yaw:+.3f},{raw_heave:+.3f}) -> "
+                        f"mapped({fwd:+.3f},{sway:+.3f},{yaw:+.3f},{heave:+.3f})",
+                        flush=True,
+                    )
+                    self._sitl_last_cmd_log = now
+                    self._sitl_last_cmd_nonzero = (fwd, sway, yaw, heave)
             nonzero = abs(fwd) > 0.01 or abs(sway) > 0.01 or abs(heave) > 0.01 or abs(yaw) > 0.01
             if nonzero:
                 now = time.monotonic()
@@ -586,6 +669,17 @@ class Ros2Bridge:
         sway = self._pwm_to_normalized(lateral_pwm)
         heave = self._pwm_to_normalized(throttle_pwm)
         yaw = self._pwm_to_normalized(yaw_pwm)
+        fwd, sway, yaw, heave = self._sitl_map_and_scale(fwd, sway, yaw, heave)
+        if self._sitl_cmd_debug and self.enable_sitl:
+            now = time.monotonic()
+            if now - self._sitl_last_cmd_log > 0.15:
+                print(
+                    "[ros2_bridge] MAVROS RC override raw->mapped: "
+                    f"raw({forward_pwm},{lateral_pwm},{throttle_pwm},{yaw_pwm}) -> "
+                    f"mapped({fwd:+.3f},{sway:+.3f},{yaw:+.3f},{heave:+.3f})",
+                    flush=True,
+                )
+                self._sitl_last_cmd_log = now
         self._handle_normalized_cmd(fwd, sway, yaw, heave)
 
     def _quat_to_rpy(self, quat: np.ndarray) -> tuple[float, float, float]:

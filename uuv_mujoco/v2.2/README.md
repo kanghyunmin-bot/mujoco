@@ -178,6 +178,36 @@ cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
 ./launch_competition_sim.sh --sitl --images
 ```
 
+### QGC 입력 방향/세기 조정(중요)
+
+QGC가 보내는 `manual` 채널 축이 모델에 맞지 않으면 전후/좌우/상하가 엇나갑니다.  
+SITL 입력만 임시 보정하려면 다음 옵션을 `launch_competition_sim.sh` 또는 `run_urdf_full.py`에 추가하세요.
+
+```bash
+./launch_competition_sim.sh --sitl --images \
+  --sitl-rc-ch-forward 1 \
+  --sitl-rc-ch-lateral 0 \
+  --sitl-rc-ch-throttle 2 \
+  --sitl-rc-ch-yaw 3 \
+  --sitl-forward-sign 1 \
+  --sitl-lateral-sign -1 \
+  --sitl-yaw-sign 1 \
+  --sitl-heave-sign -1 \
+  --sitl-cmd-scale 0.4 \
+  --sitl-command-debug
+```
+
+정리:
+- `--sitl-rc-ch-*` : RC 채널 인덱스 재매핑(0 시작).
+- `--sitl-*-sign` : 축 부호 뒤집기(`1` 또는 `-1`).
+- `--sitl-cmd-scale` : 입력 감도(0.2~1.0 권장).
+- `--sitl-command-debug` : QGC → PWM → 정규화 → 매핑 출력 로그.
+
+권장 튜닝 순서:
+1. `--sitl-command-debug`로 입력 로그를 켜고 스틱/키를 한 축씩 움직인다.
+2. 한 번에 한 축이 한 방향으로만 움직이면 정상, 반대/여러축이 붙으면 sign/channel 조정.
+3. 너무 민감하면 `--sitl-cmd-scale` 값을 1보다 작게 낮춘다.
+
 터미널 3은 선택 사항입니다. (ROS2 토픽 제어를 쓰는 경우에만 필요)
 
 `/cmd_vel` 기반 부드러운 이동 데모:
