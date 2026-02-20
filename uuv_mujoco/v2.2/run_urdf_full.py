@@ -22,6 +22,7 @@ import numpy as np
 MODEL_PATH = Path(__file__).resolve().parent / "urdf_full_scene.xml"
 PROFILE_PATH = Path(__file__).resolve().parent / "sim_profiles.json"
 VALIDATION_THRESH_PATH = Path(__file__).resolve().parent / "validation_thresholds.json"
+THRUSTER_PERF_PATH = Path(__file__).resolve().parent / "thruster_performance.json"
 
 
 def main() -> None:
@@ -200,6 +201,23 @@ def main() -> None:
         help="Simulation profile JSON path",
     )
     parser.add_argument(
+        "--thruster-perf-file",
+        type=str,
+        default=str(THRUSTER_PERF_PATH),
+        help="PWM-thrust performance curve JSON file",
+    )
+    parser.add_argument(
+        "--thruster-voltage",
+        type=float,
+        default=20.0,
+        help="Select nearest thrust curve voltage from performance file (ex. 10,12,14,16,18,20)",
+    )
+    parser.add_argument(
+        "--disable-thruster-perf",
+        action="store_true",
+        help="Force linear thruster mapping and ignore performance curve JSON",
+    )
+    parser.add_argument(
         "--list-profiles",
         action="store_true",
         help="Print available simulation profiles and exit",
@@ -207,7 +225,7 @@ def main() -> None:
     parser.add_argument(
         "--ros2",
         action="store_true",
-        help="Enable ROS2 bridge (/cmd_vel input + IMU/DVL output)",
+        help="Enable ROS2 transport topics (/cmd_vel, /imu/data, /dvl/*)",
     )
     parser.add_argument(
         "--ros2-images",
@@ -420,6 +438,103 @@ def main() -> None:
             f"[validation] invalid threshold json: {validation_threshold_path}, using built-in defaults",
             flush=True,
         )
+
+    # Optional thruster PWM->force profile.
+    perf_cfg = {
+        "active": False,
+        "requested_voltage": float(args.thruster_voltage),
+        "selected_voltage": None,
+        "pwm": np.array([], dtype=np.float64),
+        "force": np.array([], dtype=np.float64),
+    }
+
+    def _to_float_array(values) -> np.ndarray | None:
+        if not isinstance(values, list) or not values:
+            return None
+        out = []
+        for value in values:
+            try:
+                out.append(float(value))
+            except (TypeError, ValueError):
+                return None
+        return np.array(out, dtype=np.float64)
+
+    def _normalize_thruster_perf_voltage(value: float | str | None) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(args.thruster_voltage)
+
+    def _load_thruster_performance(path: Path) -> None:
+        perf_path = path.expanduser()
+        if not perf_path.exists():
+            print(f"[thruster perf] file not found: {perf_path}", flush=True)
+            return
+        try:
+            payload = json.loads(perf_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            print(f"[thruster perf] invalid json: {perf_path}", flush=True)
+            return
+
+        curves_raw = payload.get("curves") if isinstance(payload, dict) else None
+        if not isinstance(curves_raw, list):
+            print(f"[thruster perf] missing curves in: {perf_path}", flush=True)
+            return
+
+        candidates = []
+        for curve in curves_raw:
+            if not isinstance(curve, dict):
+                continue
+            voltage = curve.get("voltage_v")
+            pwm = _to_float_array(curve.get("pwm_us"))
+            force = _to_float_array(curve.get("force_n"))
+            if voltage is None or pwm is None or force is None:
+                continue
+            if pwm.size != force.size:
+                continue
+            if pwm.size < 2:
+                continue
+            order = np.argsort(pwm)
+            pwm = pwm[order]
+            force = force[order]
+            valid = np.isfinite(pwm) & np.isfinite(force)
+            if not np.any(valid):
+                continue
+            candidates.append(
+                {
+                    "voltage": float(voltage),
+                    "pwm": pwm[valid],
+                    "force": force[valid],
+                }
+            )
+
+        if not candidates:
+            print(f"[thruster perf] no usable curve in: {perf_path}", flush=True)
+            return
+
+        requested = _normalize_thruster_perf_voltage(args.thruster_voltage)
+        selected = min(candidates, key=lambda item: abs(item["voltage"] - requested))
+        perf_cfg.update(
+            {
+                "active": True,
+                "requested_voltage": requested,
+                "selected_voltage": float(selected["voltage"]),
+                "pwm": selected["pwm"],
+                "force": selected["force"],
+            }
+        )
+        print(
+            f"[thruster perf] loaded curve {selected['voltage']}V from {perf_path} "
+            f"(requested {requested}V)",
+            flush=True,
+        )
+
+    if not args.disable_thruster_perf:
+        _load_thruster_performance(Path(args.thruster_perf_file).expanduser())
+
+    def pwm_to_force_from_perf(norm_cmd: float) -> float:
+        pwm = float(np.clip(norm_cmd, -1.0, 1.0) * 400.0 + 1500.0)
+        return float(np.interp(pwm, perf_cfg["pwm"], perf_cfg["force"]))
 
     # Load model/state once and reuse for runtime, validation, and calibration paths.
     model = mujoco.MjModel.from_xml_path(args.scene)
@@ -1030,17 +1145,20 @@ def main() -> None:
             print_status()
 
     ros_bridge = None
-    if args.ros2:
-        try:
-            from ros2_bridge import Ros2Bridge
-            enable_mavros_rc = True
-            if args.sitl and not args.allow_mavros_rc_in_sitl:
-                enable_mavros_rc = False
+    try:
+        from ros2_bridge import Ros2Bridge
+
+        enable_ros2 = bool(args.ros2)
+        enable_mavros_rc = True
+        if args.sitl and not args.allow_mavros_rc_in_sitl:
+            enable_mavros_rc = False
+            if enable_ros2:
                 print(
                     "[ros2] SITL mode: /mavros/rc/override input disabled to avoid external override conflicts.",
                     flush=True,
                 )
 
+        if args.sitl or enable_ros2:
             ros_bridge = Ros2Bridge(
                 model=model,
                 command_callback=apply_ros_cmd,
@@ -1050,26 +1168,35 @@ def main() -> None:
                 image_height=args.ros2_image_height,
                 sensor_hz=args.ros2_sensor_hz,
                 image_hz=args.ros2_image_hz,
-                enable_mavros=enable_mavros_rc,
+                enable_mavros=enable_mavros_rc if enable_ros2 else False,
                 enable_sitl=args.sitl,
                 sitl_ip=args.sitl_ip,
                 sitl_port=args.sitl_port,
                 sitl_send_port=args.sitl_send_port,
                 camera_calib_left=args.ros2_camera_calib_left,
                 camera_calib_right=args.ros2_camera_calib_right,
+                enable_ros=enable_ros2,
             )
-            viewer_control_mode["value"] = False
-            input_topics = "/cmd_vel"
-            if enable_mavros_rc:
-                input_topics += ", /mavros/rc/override"
-            print(
-                f"[ros2] bridge enabled: {input_topics} -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude, /mujoco/ground_truth/pose"
-                + (", /stereo/*" if args.ros2_images else ""),
-                flush=True,
+            if enable_ros2:
+                viewer_control_mode["value"] = False
+                input_topics = "/cmd_vel"
+                if enable_mavros_rc:
+                    input_topics += ", /mavros/rc/override"
+                print(
+                    f"[bridge] enabled: {input_topics} -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude, /mujoco/ground_truth/pose"
+                    + (", /stereo/*" if args.ros2_images else ""),
+                    flush=True,
+                )
+            elif args.sitl:
+                print("[bridge] SITL transport enabled (UDP JSON only, ROS2 disabled).", flush=True)
+                viewer_control_mode["value"] = False
+    except Exception as exc:
+        if args.sitl:
+            raise SystemExit(
+                f"[runtime] --sitl initialization failed: {exc}"
             )
-        except Exception as exc:
+        if args.ros2:
             print(f"[ros2] bridge init failed: {exc}", flush=True)
-            ros_bridge = None
 
 
     if not (
@@ -1420,6 +1547,10 @@ def main() -> None:
     cob_torque_scale = float(sim_profile.get("cob_torque_scale", 1.0))
     buoyancy_point_blend = float(np.clip(sim_profile.get("buoyancy_point_blend", 1.0), 0.0, 1.0))
     thruster_force_max = float(sim_profile.get("thruster_force_max", 50.0))
+    if perf_cfg.get("active") and perf_cfg.get("force").size > 0:
+        perf_max = float(np.max(np.abs(perf_cfg["force"])) )
+        if perf_max > 0.0:
+            thruster_force_max = perf_max
     linear_drag = float(sim_profile.get("linear_drag", 1.2))
     angular_drag = float(sim_profile.get("angular_drag", 0.12))
     # Keep tiny damping in air; full damping only when submerged.
@@ -1500,7 +1631,12 @@ def main() -> None:
             aid = act[name]
             lo, hi = ctrlrange[aid]
             gain = float(thruster_scale.get(name, 1.0))
-            data.ctrl[aid] = float(np.clip(thr_target[name] * thruster_force_max * gain, lo, hi))
+            target_norm = float(np.clip(thr_target[name], -1.0, 1.0))
+            if perf_cfg.get("active") and perf_cfg.get("force").size > 0:
+                force = pwm_to_force_from_perf(target_norm) * gain
+            else:
+                force = target_norm * thruster_force_max * gain
+            data.ctrl[aid] = float(np.clip(force, lo, hi))
 
     def update_propeller_visuals(dt: float) -> None:
         # Visual-only propeller spin (no reaction torque applied to vehicle).

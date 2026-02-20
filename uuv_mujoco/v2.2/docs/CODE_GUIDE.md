@@ -1,6 +1,6 @@
-# UUV MuJoCo v2.1 Code Guide
+# UUV MuJoCo v2.2 Code Guide
 
-이 문서는 `v2.1`의 주요 파일별 코드 원리와 실행 흐름을 정리합니다.
+이 문서는 `v2.2`의 주요 파일별 코드 원리와 실행 흐름을 정리합니다.
 
 ## 1) `run_urdf_full.py`
 
@@ -11,7 +11,7 @@
 - 조이스틱/키보드 제어
 - 검증(`--validate`, `--validate-thrusters`)
 - 캘리브레이션(`--calibrate-*`)
-- ROS2 브리지 활성화(`--ros2`)
+- ROS2 브리지 활성화(`--ros2`, 선택적)
 
 ### 1.2 핵심 흐름
 
@@ -47,7 +47,7 @@
 
 - `/cmd_vel` 구독 후 시뮬레이터 명령으로 변환
 - IMU/DVL 센서를 ROS2 메시지로 발행
-- 옵션으로 stereo image + camera_info 발행
+- 기본으로 `--sitl`은 JSON UDP만 사용하며, `--ros2` 지정 시 `sitl` + `stereo image + camera_info`를 ROS2로 발행합니다.
 
 ### 2.2 핵심 함수
 

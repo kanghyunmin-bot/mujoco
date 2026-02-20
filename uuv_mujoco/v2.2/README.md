@@ -89,7 +89,8 @@ python3 run_urdf_full.py --scene ocean_scene.xml
 
 ### 조이스틱/ROS2 입력
 
-- 기본 실행은 `터미널 + 로컬 조이스틱(/dev/input/js*) + ROS2(/cmd_vel, /mavros/rc/override)` 입력을 모두 지원합니다.
+- 기본 실행은 `터미널 + 로컬 조이스틱(/dev/input/js*)` 입력을 지원합니다.
+- ROS2 토픽(`/cmd_vel`, `/mavros/rc/override`)은 `--ros2` 옵션에서만 활성화됩니다.
 - 로컬 조이스틱만 끄고 싶다면 `--disable-joystick`을 사용하세요.
 - QGC의 STABILIZE/ALT\_HOLD 같은 모드는 ArduSub 모드에서 처리되며, 시뮬레이터는 `/mavros/rc/override` 또는 `/cmd_vel` 입력을 그대로 받습니다.
 
@@ -145,17 +146,9 @@ python3 run_urdf_full.py \
   --ros2-camera-calib-right calibration/right.yaml
 ```
 
-QGroundControl 영상(UDP H264) 브리지:
-
-```bash
-source /opt/ros/humble/setup.bash
-python3 scripts/ros2_to_qgc_video.py --topic /stereo/left/image_raw --host 127.0.0.1 --port 5600 --fps 15 --bitrate-kbps 2000
-```
-
-QGroundControl 설정:
-- `Application Settings > General > Video`
-- `Video Source = UDP h.264 Video Stream`
-- `UDP Port = 5600`
+영상 연동(선택):
+영상 스트리밍 브리지는 운영 환경에서만 사용되며, 기본 제어/연결 경로의 필수 구성요소가 아닙니다.
+제어/기체 연동은 ArduPilot SITL JSON + MAVLink/MAVROS 경로를 사용합니다.
 
 스테레오 calibration GUI 실행:
 
@@ -185,13 +178,7 @@ cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
 ./launch_competition_sim.sh --sitl --images
 ```
 
-터미널 3 (QGC 영상 브리지, 선택):
-
-```bash
-cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
-source /opt/ros/humble/setup.bash
-python3 scripts/ros2_to_qgc_video.py --topic /stereo/left/image_raw --host 127.0.0.1 --port 5600 --fps 15 --bitrate-kbps 2000
-```
+터미널 3은 선택 사항입니다. (ROS2 토픽 제어를 쓰는 경우에만 필요)
 
 `/cmd_vel` 기반 부드러운 이동 데모:
 
@@ -290,7 +277,8 @@ docker run --rm -it --network host \
   - 5~10초 이상 계속 반복되면 비정상
   - MuJoCo를 반드시 `--sitl`로 실행해야 함:
     - `./launch_competition_sim.sh --sitl --images`
-  - 현재 스크립트는 `--sitl` 또는 `--images`에 대해 `--ros2`를 자동으로 같이 활성화함
+  - `--images`는 카메라 토픽 사용이 필요하므로 `--ros2`를 함께 요청합니다.
+  - `--sitl`만 사용하면 기본 동작은 MAVLink JSON UDP만 사용합니다.
   - ArduSub는 `--model JSON`으로 실행되어야 함:
   - `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh`
   - QGC 링크 타입을 강제하려면:

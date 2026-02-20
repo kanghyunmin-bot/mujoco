@@ -1,7 +1,7 @@
 #!/bin/bash
-# Launch MuJoCo competition simulation with ROS2 bridge
+# Launch MuJoCo competition simulation
 # Usage:
-#   ./launch_competition_sim.sh [--headless] [--images] [--sitl]
+#   ./launch_competition_sim.sh [--headless] [--sitl] [--images] [--ros2]
 #   ./launch_competition_sim.sh --sitl --images --calib-left calibration/left.yaml --calib-right calibration/right.yaml
 
 set -e
@@ -9,19 +9,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Source ROS2
-source /opt/ros/humble/setup.bash
-
 # Parse arguments
 HEADLESS=false
 IMAGES=""
-FORCE_ROS2=false
+ROS2_REQUESTED=false
 HEADLESS_ARG=""
 SITL_ARG=""
 SITL_PORT="9002"
 SITL_SEND_PORT="9003"
 EXTRA_ARGS=()
 PROFILE=""
+THRUSTER_VOLTAGE=""
 HOVER_STABLE_REQUESTED=false
 ALLOW_LOCAL_JOYSTICK=false
 while [[ $# -gt 0 ]]; do
@@ -32,12 +30,16 @@ while [[ $# -gt 0 ]]; do
             ;;
         --images)
             IMAGES="--ros2-images"
-            FORCE_ROS2=true
+            ROS2_REQUESTED=true
             shift
             ;;
         --sitl)
             SITL_ARG="--sitl"
-            FORCE_ROS2=true
+            shift
+            ;;
+        --ros2)
+            ROS2_REQUESTED=true
+            EXTRA_ARGS+=("--ros2")
             shift
             ;;
         --sitl-port)
@@ -66,7 +68,6 @@ while [[ $# -gt 0 ]]; do
                 EXTRA_ARGS+=("--depth-hold" "--imu-stabilize")
                 PROFILE="sim_hover"
             fi
-            FORCE_ROS2=true
             shift
             ;;
         --allow-local-joystick)
@@ -80,6 +81,15 @@ while [[ $# -gt 0 ]]; do
             fi
             PROFILE="$2"
             EXTRA_ARGS+=("--profile" "$2")
+            shift 2
+            ;;
+        --thruster-voltage)
+            if [[ $# -lt 2 ]]; then
+                echo "Missing value for --thruster-voltage"
+                exit 2
+            fi
+            THRUSTER_VOLTAGE="$2"
+            EXTRA_ARGS+=("--thruster-voltage" "$2")
             shift 2
             ;;
         --calib-left)
@@ -115,33 +125,40 @@ fi
 
 echo "[launch] Starting MuJoCo UUV Competition Simulation"
 echo "[launch] Scene: competition_scene.xml"
-if [ "$FORCE_ROS2" = true ] && [[ "$HEADLESS" == false ]]; then
-    echo "[launch] Note: --sitl or --images requested, automatically enabling --ros2"
+if [ "$ROS2_REQUESTED" = true ] && [[ "$HEADLESS" == false ]]; then
+    echo "[launch] Source ROS2 environment for --ros2 topics and stereo image transport."
+    source /opt/ros/humble/setup.bash
 fi
-echo "[launch] ROS2 Topics:"
-echo "  Input:  /cmd_vel, /mavros/rc/override"
-echo "  Output: /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude"
-echo "  Debug:  /mujoco/ground_truth/pose"
-if [ -n "$IMAGES" ]; then
-    echo "  Images: /stereo/left/image_raw, /stereo/right/image_raw"
+echo "[launch] Bridge:"
+if [ "$ROS2_REQUESTED" = true ]; then
+    echo "  ROS2 Transport: enabled"
+    echo "    Input:  /cmd_vel, /mavros/rc/override"
+    echo "    Output: /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude"
+    echo "    Debug:  /mujoco/ground_truth/pose"
+    if [ -n "$IMAGES" ]; then
+        echo "    Images: /stereo/left/image_raw, /stereo/right/image_raw"
+    fi
+else
+    echo "  ROS2 Transport: disabled (SITL UDP JSON only)"
 fi
 echo ""
 
-if [ "$FORCE_ROS2" = true ]; then
-    EXTRA_ARGS+=("--ros2")
-    if [[ -n "$SITL_ARG" ]]; then
-        # Intentionally do not force extra stabilization/depth-hold for SITL.
-        # ArduPilot/QGC depth and attitude modes should own these loops.
-        if [[ -z "$PROFILE" ]]; then
-            PROFILE="sim_real"
-            EXTRA_ARGS+=("--profile" "$PROFILE")
-        fi
-        if [[ "$ALLOW_LOCAL_JOYSTICK" == false ]]; then
-            # Prevent accidental local joystick noise from overriding SITL inputs.
-            EXTRA_ARGS+=("--disable-joystick")
-            echo "[launch] SITL mode: local /dev/input joystick disabled (use --allow-local-joystick to override)."
-        fi
+if [[ -n "$SITL_ARG" ]]; then
+    # Intentionally do not force extra stabilization/depth-hold for SITL.
+    # ArduPilot/QGC depth and attitude modes should own these loops.
+    if [[ -z "$PROFILE" ]]; then
+        PROFILE="sim_real"
+        EXTRA_ARGS+=(--profile "$PROFILE")
     fi
+    if [[ "$ALLOW_LOCAL_JOYSTICK" == false && "$ROS2_REQUESTED" == false ]]; then
+        # Prevent accidental local joystick noise from overriding SITL inputs.
+        EXTRA_ARGS+=(--disable-joystick)
+        echo "[launch] SITL mode: local /dev/input joystick disabled (use --allow-local-joystick to override)."
+    fi
+fi
+
+if [ "$ROS2_REQUESTED" = true ]; then
+    EXTRA_ARGS+=(--ros2)
 fi
 
 if [[ "$HOVER_STABLE_REQUESTED" == true && -n "$SITL_ARG" && -n "$PROFILE" && "$PROFILE" == "sim_hover" ]]; then

@@ -1,12 +1,12 @@
-"""ROS2 bridge for MuJoCo UUV simulation.
+"""Bridge between MuJoCo state and downstream control paths.
 
 Responsibilities:
-1) Subscribe `/cmd_vel` and convert it to internal command channels.
-2) Subscribe `/mavros/rc/override` for MAVROS/ArduSub compatibility.
-3) Publish IMU/DVL sensor streams from MuJoCo sensor data.
-4) Publish DVL odometry for position controller compatibility.
-5) Publish ground truth pose for debugging.
-6) Optionally publish stereo images and camera_info.
+1) Handle SITL UDP socket (ArduPilot JSON payload + servo packets).
+2) Optional ROS2 transport:
+   - `/cmd_vel` and `/mavros/rc/override` input
+   - IMU/DVL publish
+   - DVL odometry
+   - Stereo image publish
 """
 
 import json
@@ -41,48 +41,66 @@ class Ros2Bridge:
         sitl_send_port: int = 9003,
         camera_calib_left: str = "",
         camera_calib_right: str = "",
+        enable_ros: bool = True,
     ) -> None:
-        # ROS2 imports are runtime-optional so the simulator can run without ROS2.
-        try:
-            import rclpy
-            from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
-            from nav_msgs.msg import Odometry
-            from rclpy.node import Node
-            from sensor_msgs.msg import CameraInfo, Image, Imu, Range
-            from std_msgs.msg import Header
-        except ImportError as exc:
-            raise RuntimeError(
-                "ROS2 packages not found. Install rclpy + sensor_msgs + geometry_msgs + nav_msgs."
-            ) from exc
-
-        # Try to import mavros_msgs for MAVROS compatibility
+        self._enable_ros = bool(enable_ros)
         self.has_mavros = False
-        try:
-            from mavros_msgs.msg import OverrideRCIn
-            self.OverrideRCIn = OverrideRCIn
-            self.has_mavros = True
-        except ImportError:
-            self.OverrideRCIn = None
-            if enable_mavros:
-                print("[ros2_bridge] mavros_msgs not found, MAVROS input disabled", flush=True)
+        self.OverrideRCIn = None
 
-        self.rclpy = rclpy
-        self.Twist = Twist
-        self.TwistStamped = TwistStamped
-        self.PoseStamped = PoseStamped
-        self.Odometry = Odometry
-        self.CameraInfo = CameraInfo
-        self.Image = Image
-        self.Imu = Imu
-        self.Range = Range
-        self.Header = Header
+        if self._enable_ros:
+            # ROS2 imports are runtime-optional so the simulator can run
+            # without ROS2 when only SITL UDP is needed.
+            try:
+                import rclpy
+                from geometry_msgs.msg import Twist, TwistStamped, PoseStamped
+                from nav_msgs.msg import Odometry
+                from rclpy.node import Node
+                from sensor_msgs.msg import CameraInfo, Image, Imu, Range
+                from std_msgs.msg import Header
+            except ImportError as exc:
+                raise RuntimeError(
+                    "ROS2 packages not found. Install rclpy + sensor_msgs + geometry_msgs + nav_msgs."
+                ) from exc
 
-        if not self.rclpy.ok():
-            self.rclpy.init(args=None)
-        self.node = Node("uuv_mujoco_bridge")
-        # Keep SITL running even if ROS2 context becomes invalid at runtime.
-        self._ros_ok = True
-        self._ros_error_reported = False
+            # Try to import mavros_msgs for MAVROS compatibility
+            try:
+                from mavros_msgs.msg import OverrideRCIn
+                self.OverrideRCIn = OverrideRCIn
+                self.has_mavros = True
+            except ImportError:
+                if enable_mavros:
+                    print("[ros2_bridge] mavros_msgs not found, MAVROS input disabled", flush=True)
+
+            self.rclpy = rclpy
+            self.Twist = Twist
+            self.TwistStamped = TwistStamped
+            self.PoseStamped = PoseStamped
+            self.Odometry = Odometry
+            self.CameraInfo = CameraInfo
+            self.Image = Image
+            self.Imu = Imu
+            self.Range = Range
+            self.Header = Header
+            if not self.rclpy.ok():
+                self.rclpy.init(args=None)
+            self.node = Node("uuv_mujoco_bridge")
+            # Keep SITL running even if ROS2 context becomes invalid at runtime.
+            self._ros_ok = True
+            self._ros_error_reported = False
+        else:
+            self.rclpy = None
+            self.Twist = None
+            self.TwistStamped = None
+            self.PoseStamped = None
+            self.Odometry = None
+            self.CameraInfo = None
+            self.Image = None
+            self.Imu = None
+            self.Range = None
+            self.Header = None
+            self.node = None
+            self._ros_ok = False
+            self._ros_error_reported = False
 
         self.command_callback = command_callback
         self.cmd_limit = float(cmd_limit)
@@ -146,22 +164,29 @@ class Ros2Bridge:
         self._odom_yaw = 0.0
         self._last_odom_time = -1.0
 
-        # Core sensor publishers
-        self.pub_imu = self.node.create_publisher(self.Imu, "/imu/data", 10)
-        self.pub_dvl_vel = self.node.create_publisher(self.TwistStamped, "/dvl/velocity", 10)
-        self.pub_dvl_alt = self.node.create_publisher(self.Range, "/dvl/altitude", 10)
-        self.pub_dvl_odom = self.node.create_publisher(self.Odometry, "/dvl/odometry", 10)
-        self.pub_ground_truth = self.node.create_publisher(self.PoseStamped, "/mujoco/ground_truth/pose", 10)
-        
-        # Command subscribers
-        self.sub_cmd = self.node.create_subscription(self.Twist, "/cmd_vel", self._on_cmd_vel, 10)
-        
-        # MAVROS RC Override subscriber (for ArduSub/Pixhawk compatibility)
+        # Core sensor publishers / ROS2 control channels (optional).
+        self.pub_imu = None
+        self.pub_dvl_vel = None
+        self.pub_dvl_alt = None
+        self.pub_dvl_odom = None
+        self.pub_ground_truth = None
+        self.sub_cmd = None
         self.sub_mavros_rc = None
-        if self.has_mavros and self.enable_mavros:
-            self.sub_mavros_rc = self.node.create_subscription(
-                self.OverrideRCIn, "/mavros/rc/override", self._on_mavros_rc_override, 10
-            )
+        if self._enable_ros:
+            self.pub_imu = self.node.create_publisher(self.Imu, "/imu/data", 10)
+            self.pub_dvl_vel = self.node.create_publisher(self.TwistStamped, "/dvl/velocity", 10)
+            self.pub_dvl_alt = self.node.create_publisher(self.Range, "/dvl/altitude", 10)
+            self.pub_dvl_odom = self.node.create_publisher(self.Odometry, "/dvl/odometry", 10)
+            self.pub_ground_truth = self.node.create_publisher(self.PoseStamped, "/mujoco/ground_truth/pose", 10)
+
+            # Command subscribers
+            self.sub_cmd = self.node.create_subscription(self.Twist, "/cmd_vel", self._on_cmd_vel, 10)
+
+            # MAVROS RC Override subscriber (for ArduSub/Pixhawk compatibility)
+            if self.has_mavros and self.enable_mavros:
+                self.sub_mavros_rc = self.node.create_subscription(
+                    self.OverrideRCIn, "/mavros/rc/override", self._on_mavros_rc_override, 10
+                )
 
         # PWM parameters for MAVROS
         self._pwm_min = 1100
@@ -173,11 +198,12 @@ class Ros2Bridge:
         self._ch_lateral = self._env_to_int("ROS2_UUV_RC_CH_LATERAL", 0)
         self._ch_throttle = self._env_to_int("ROS2_UUV_RC_CH_THROTTLE", 2)
         self._ch_yaw = self._env_to_int("ROS2_UUV_RC_CH_YAW", 3)
-        self.node.get_logger().info(
-            f"Using MAVLink RC override channel map: "
-            f"forward={self._ch_forward}, lateral={self._ch_lateral}, "
-            f"throttle={self._ch_throttle}, yaw={self._ch_yaw}"
-        )
+        if self._enable_ros:
+            self.node.get_logger().info(
+                f"Using MAVLink RC override channel map: "
+                f"forward={self._ch_forward}, lateral={self._ch_lateral}, "
+                f"throttle={self._ch_throttle}, yaw={self._ch_yaw}"
+            )
 
         self.model = model
         self.sensor_ids = {}
@@ -200,7 +226,7 @@ class Ros2Bridge:
             "stereo_right": str(camera_calib_right or ""),
         }
 
-        if self.publish_images:
+        if self.publish_images and self._enable_ros:
             for cname in ("stereo_left", "stereo_right"):
                 cid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, cname)
                 if cid < 0:
@@ -229,14 +255,15 @@ class Ros2Bridge:
                 else:
                     self.cam_info[cname] = default_info
 
-        topics_info = "/cmd_vel -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude"
-        if self.has_mavros and self.enable_mavros:
-            topics_info += ", /mavros/rc/override"
-        if self.publish_images:
-            topics_info += ", /stereo/*"
-        if self.enable_sitl:
-            topics_info += f", SITL({self.sitl_addr[0]}:{self.sitl_addr[1]})"
-        self.node.get_logger().info(f"ROS2 bridge active: {topics_info}")
+        if self._enable_ros:
+            topics_info = "/cmd_vel -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude"
+            if self.has_mavros and self.enable_mavros:
+                topics_info += ", /mavros/rc/override"
+            if self.publish_images:
+                topics_info += ", /stereo/*"
+            if self.enable_sitl:
+                topics_info += f", SITL({self.sitl_addr[0]}:{self.sitl_addr[1]})"
+            self.node.get_logger().info(f"ROS2 bridge active: {topics_info}")
 
     @staticmethod
     def _finite_or_zero(value: float) -> float:
@@ -354,12 +381,13 @@ class Ros2Bridge:
                         flush=True,
                     )
                 self._sitl_client_addr = addr
-                if not self._sitl_client_logged:
-                    self._sitl_client_logged = True
-
-                self._sitl_client_last_wall = time.monotonic()
-                self._sitl_last_command_stale_wall = -1.0
-                got_any = True
+                self._sitl_client_logged = True
+            
+            # Keep last-received wall time updated on every packet to avoid
+            # emitting false stale warnings when the source port is stable.
+            self._sitl_client_last_wall = time.monotonic()
+            self._sitl_last_command_stale_wall = -1.0
+            got_any = True
 
             # 16-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(16*2)
             # 32-ch packet: magic(2) + frame_rate(2) + frame_count(4) + pwm(32*2)
@@ -421,11 +449,15 @@ class Ros2Bridge:
         # - gyro: rad/s (body FRD)
         # - accel_body: m/s^2 (body FRD)
         # - position/velocity: NED frame
-        # - quaternion: [w, x, y, z] body->NED
+        # - quaternion: [w, x, y, z] body->NED (newer JSON parser)
+        # - attitude: [roll, pitch, yaw] radians (legacy JSON parser)
         now_wall = time.monotonic()
         if self._sitl_t0_wall is None:
             self._sitl_t0_wall = now_wall
         sitl_t = now_wall - self._sitl_t0_wall
+
+        roll, pitch, yaw = self._quat_to_rpy(quat)
+        attitude = [float(roll), float(pitch), float(yaw)]
 
         payload = {
             "timestamp": float(sitl_t),
@@ -435,6 +467,7 @@ class Ros2Bridge:
             },
             "position": [float(x) for x in pos],
             "velocity": [float(x) for x in vel],
+            "attitude": attitude,
             "quaternion": [float(x) for x in quat],
         }
 
@@ -450,12 +483,14 @@ class Ros2Bridge:
                 },
                 "position": [0.0, 0.0, 0.0],
                 "velocity": [0.0, 0.0, 0.0],
+                "attitude": [0.0, 0.0, 0.0],
                 "quaternion": [1.0, 0.0, 0.0, 0.0],
             }
         else:
             payload["imu"]["gyro"] = [float(x) for x in np.clip(gyro, -20.0, 20.0)]
             payload["imu"]["accel_body"] = [float(x) for x in np.clip(acc, -40.0, 40.0)]
             payload["velocity"] = [float(x) for x in np.clip(vel, -20.0, 20.0)]
+            payload["attitude"] = attitude
 
         # Skip invalid payloads because ArduPilot JSON parser is strict enough
         # to reject non-finite values and then stall lockstep.
@@ -465,6 +500,7 @@ class Ros2Bridge:
             np.array(payload["velocity"], dtype=np.float64),
             np.array(payload["position"], dtype=np.float64),
             np.array(payload["quaternion"], dtype=np.float64),
+            np.array(payload["attitude"], dtype=np.float64),
         )
         if not np.isfinite(float(payload["timestamp"])) or any(not np.all(np.isfinite(a)) for a in arrs):
             if not self._sitl_nonfinite_warned:
@@ -552,6 +588,31 @@ class Ros2Bridge:
         yaw = self._pwm_to_normalized(yaw_pwm)
         self._handle_normalized_cmd(fwd, sway, yaw, heave)
 
+    def _quat_to_rpy(self, quat: np.ndarray) -> tuple[float, float, float]:
+        """Convert quaternion [w, x, y, z] to roll/pitch/yaw in radians."""
+        w, x, y, z = quat
+        # Normalize defensively to avoid NaN on malformed values.
+        norm = float(np.linalg.norm(quat))
+        if norm <= 1e-12:
+            return 0.0, 0.0, 0.0
+        q0, q1, q2, q3 = w / norm, x / norm, y / norm, z / norm
+
+        sinr_cosp = 2.0 * (q0 * q1 + q2 * q3)
+        cosr_cosp = 1.0 - 2.0 * (q1 * q1 + q2 * q2)
+        roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+        sinp = 2.0 * (q0 * q2 - q3 * q1)
+        if abs(sinp) >= 1.0:
+            pitch = np.copysign(np.pi / 2.0, sinp)
+        else:
+            pitch = np.arcsin(sinp)
+
+        siny_cosp = 2.0 * (q0 * q3 + q1 * q2)
+        cosy_cosp = 1.0 - 2.0 * (q2 * q2 + q3 * q3)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+        return float(roll), float(pitch), float(yaw)
+
     def _on_cmd_vel(self, msg) -> None:
         """Map normalized ROS2 cmd_vel into bounded simulator command units."""
         clip = lambda v: float(np.clip(v, -1.0, 1.0))
@@ -563,6 +624,14 @@ class Ros2Bridge:
 
     def spin_once(self) -> None:
         """Advance ROS2 callbacks and enforce cmd timeout fail-safe."""
+        if not self._enable_ros:
+            self._poll_sitl_servo_endpoint()
+            if self.cmd_active and (time.monotonic() - self.last_cmd_wall > self.cmd_timeout_s):
+                self._cmd_filter_t = time.monotonic()
+                self._cmd_filter_norm = np.zeros(4, dtype=np.float64)
+                self.command_callback(0.0, 0.0, 0.0, 0.0)
+                self.cmd_active = False
+            return
         if not self._ros_ok:
             return
         try:
@@ -724,7 +793,7 @@ class Ros2Bridge:
             self._send_sitl_data(sim_t, gyro_frd, acc_frd, vel_ned, pos_ned, quat_ned_bfrd)
 
         # ROS2 context may be unavailable while SITL continues running.
-        if not self._ros_ok:
+        if not self._enable_ros or not self._ros_ok:
             return
 
         def _safe_publish(publisher, msg, label: str) -> bool:
@@ -895,6 +964,8 @@ class Ros2Bridge:
                 renderer.close()
             except Exception:
                 pass
+        if not self._enable_ros:
+            return
         try:
             self.node.destroy_node()
         except Exception:
