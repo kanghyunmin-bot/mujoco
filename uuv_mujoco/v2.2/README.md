@@ -159,7 +159,7 @@ python3 run_urdf_full.py \
 기본 SITL 실행:
 
 ```bash
-./launch_competition_sim.sh --sitl --images
+./launch_competition_sim.sh --sitl --images --force-clean
 ```
 
 ArduSub(JSON)+QGroundControl 권장 실행 순서:
@@ -168,45 +168,47 @@ ArduSub(JSON)+QGroundControl 권장 실행 순서:
 
 ```bash
 cd /home/khm/antigravity
-./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --frame vectored
+./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --frame vectored_6dof --force-clean
 ```
+
+기본 SITL 실행 스크립트는 안정화 목적으로 다음 파라미터를 자동 적용합니다:
+`ARMING_CHECK=0`, `EK3_IMU_MASK=1`, `INS_USE2/3=0`, `COMPASS_USE2/3=0`, `FS_GCS_ENABLE=0`
 
 터미널 2 (MuJoCo bridge + competition map):
 
 ```bash
 cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
-./launch_competition_sim.sh --sitl --images
+./launch_competition_sim.sh --sitl --images --force-clean
 ```
 
 ### QGC 입력 방향/세기 조정(중요)
 
-QGC가 보내는 `manual` 채널 축이 모델에 맞지 않으면 전후/좌우/상하가 엇나갑니다.  
-SITL 입력만 임시 보정하려면 다음 옵션을 `launch_competition_sim.sh` 또는 `run_urdf_full.py`에 추가하세요.
+기본 SITL 경로는 `--sitl-servo-map auto` 역믹서 모드입니다.  
+ArduSub PWM(servo 1..N)을 프레임 믹서 기준으로 `forward/lateral/yaw/heave/roll/pitch`로 복원한 뒤,
+MuJoCo 쓰러스터로 재할당합니다.
 
 ```bash
-./launch_competition_sim.sh --sitl --images \
-  --sitl-rc-ch-forward 1 \
-  --sitl-rc-ch-lateral 0 \
-  --sitl-rc-ch-throttle 2 \
-  --sitl-rc-ch-yaw 3 \
-  --sitl-forward-sign 1 \
-  --sitl-lateral-sign -1 \
-  --sitl-yaw-sign 1 \
-  --sitl-heave-sign -1 \
-  --sitl-cmd-scale 0.4 \
+./launch_competition_sim.sh --sitl --images --force-clean \
+  --sitl-servo-map auto \
+  --sitl-mixer-frame auto \
+  --sitl-servo-scale 1.0 \
+  --sitl-roll-scale 0.45 \
+  --sitl-pitch-scale 0.45 \
   --sitl-command-debug
 ```
 
 정리:
-- `--sitl-rc-ch-*` : RC 채널 인덱스 재매핑(0 시작).
-- `--sitl-*-sign` : 축 부호 뒤집기(`1` 또는 `-1`).
-- `--sitl-cmd-scale` : 입력 감도(0.2~1.0 권장).
-- `--sitl-command-debug` : QGC → PWM → 정규화 → 매핑 출력 로그.
+- `--sitl-servo-map auto` : ArduSub mixer 역추정 자동 모드.
+- `--sitl-mixer-frame` : `auto|vectored|vectored_6dof` 프레임 선택.
+- `--sitl-servo-scale` : 조작 감도(전체 스케일).
+- `--sitl-roll-scale`, `--sitl-pitch-scale` : STABILIZE 롤/피치 보정 감도(기본 0.45).
+- `--sitl-command-debug` : `SITL servo pwm[1..8]` + 역믹싱 결과 로그 출력.
 
-권장 튜닝 순서:
-1. `--sitl-command-debug`로 입력 로그를 켜고 스틱/키를 한 축씩 움직인다.
-2. 한 번에 한 축이 한 방향으로만 움직이면 정상, 반대/여러축이 붙으면 sign/channel 조정.
-3. 너무 민감하면 `--sitl-cmd-scale` 값을 1보다 작게 낮춘다.
+프레임별 권장:
+- `vectored`: 6모터 ArduSub 출력 기반
+- `vectored_6dof`: 8모터 ArduSub 출력 기반
+
+레거시 축 재매핑이 필요하면 `--no-sitl-direct-thrusters`를 추가하고 기존 `--sitl-rc-ch-*`, `--sitl-*-sign`, `--sitl-cmd-scale`를 사용하세요.
 
 터미널 3은 선택 사항입니다. (ROS2 토픽 제어를 쓰는 경우에만 필요)
 
