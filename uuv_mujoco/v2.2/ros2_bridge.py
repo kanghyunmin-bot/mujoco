@@ -174,15 +174,16 @@ class Ros2Bridge:
         self._sitl_cmd_sign = np.where(np.isfinite(self._sitl_cmd_sign), self._sitl_cmd_sign, 1.0)
         self._sitl_cmd_sign[np.isclose(self._sitl_cmd_sign, 0.0)] = 1.0
         # Frame conversion:
-        # - MuJoCo world is treated as ENU-like (z-up).
-        # - ArduPilot JSON expects NED world and FRD body vectors.
-        self._enu_to_ned = np.diag([1.0, 1.0, -1.0])
-        # MuJoCo body axes in this model are [x=fwd, y=down, z=right] (FDR),
+        # - This MuJoCo project uses world axes x=forward, y=left, z=up.
+        # - ArduPilot JSON expects world NED: x=north, y=east(right), z=down.
+        #   Therefore world->NED is a proper 180deg rotation about +x.
+        self._enu_to_ned = np.diag([1.0, -1.0, -1.0])
+        # MuJoCo body axes in this model are [x=fwd, y=down, z=left] (FDL),
         # while ArduPilot expects FRD [x=fwd, y=right, z=down].
         self._bmj_to_frd = np.array(
             [
                 [1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
                 [0.0, 1.0, 0.0],
             ],
             dtype=np.float64,
