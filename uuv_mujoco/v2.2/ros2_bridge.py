@@ -797,6 +797,7 @@ class Ros2Bridge:
         msg = str(exc).lower()
         return (
             "context is not valid" in msg
+            or "context is invalid" in msg
             or "rcl_shutdown" in msg
             or "rcl_init() was not called" in msg
         )

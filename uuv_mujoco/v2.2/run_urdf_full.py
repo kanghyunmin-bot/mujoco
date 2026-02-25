@@ -2801,10 +2801,20 @@ def main() -> None:
 
     if args.headless:
         print("[runtime] headless mode enabled: running without GLFW viewer", flush=True)
+        target_dt = float(max(model.opt.timestep, 1e-6))
+        next_wall = time.perf_counter()
         while not stop_event.is_set():
             is_paused = paused_flag["value"]
             run_step(is_paused)
-            time.sleep(model.opt.timestep)
+            # Keep real-time pacing without accumulating extra delay from
+            # compute time (important for SITL stabilization responsiveness).
+            next_wall += target_dt
+            now_wall = time.perf_counter()
+            sleep_s = next_wall - now_wall
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+            else:
+                next_wall = now_wall
         if ros_bridge is not None:
             ros_bridge.shutdown()
         stop_event.set()
@@ -3009,7 +3019,8 @@ def main() -> None:
                 ])
 
             viewer.sync()
-            time.sleep(model.opt.timestep)
+            # Passive viewer sync already handles GUI/event pacing. Additional
+            # fixed sleep here increases control/sensor latency for SITL.
 
     if ros_bridge is not None:
         ros_bridge.shutdown()
