@@ -791,6 +791,16 @@ class Ros2Bridge:
         yaw = clip(msg.angular.z)
         self._handle_normalized_cmd(fwd, sway, yaw, heave)
 
+    @staticmethod
+    def _is_ros_context_shutdown_error(exc: Exception) -> bool:
+        """Return True when exception indicates normal ROS2 context shutdown."""
+        msg = str(exc).lower()
+        return (
+            "context is not valid" in msg
+            or "rcl_shutdown" in msg
+            or "rcl_init() was not called" in msg
+        )
+
     def spin_once(self) -> None:
         """Advance ROS2 callbacks and enforce cmd timeout fail-safe."""
         if not self._enable_ros:
@@ -808,7 +818,16 @@ class Ros2Bridge:
         except Exception as exc:
             if not self._ros_error_reported:
                 self._ros_error_reported = True
-                print(f"[ros2_bridge] ROS2 callbacks disabled (SITL still active): {exc}", flush=True)
+                if self._is_ros_context_shutdown_error(exc):
+                    print(
+                        "[ros2_bridge] ROS2 context closed; callbacks stopped (SITL stays active).",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[ros2_bridge] ROS2 callbacks disabled (SITL still active): {exc}",
+                        flush=True,
+                    )
             self._ros_ok = False
             return
         if self.cmd_active and (time.monotonic() - self.last_cmd_wall > self.cmd_timeout_s):
@@ -987,7 +1006,13 @@ class Ros2Bridge:
             except Exception as exc:
                 if not self._ros_error_reported:
                     self._ros_error_reported = True
-                    print(f"[ros2_bridge] ROS2 publish blocked ({label}): {exc}", flush=True)
+                    if self._is_ros_context_shutdown_error(exc):
+                        print(
+                            f"[ros2_bridge] ROS2 context closed; publish stopped ({label}).",
+                            flush=True,
+                        )
+                    else:
+                        print(f"[ros2_bridge] ROS2 publish blocked ({label}): {exc}", flush=True)
                 self._ros_ok = False
                 return False
 
@@ -996,7 +1021,16 @@ class Ros2Bridge:
         except Exception as exc:
             if not self._ros_error_reported:
                 self._ros_error_reported = True
-                print(f"[ros2_bridge] ROS2 publishing disabled (SITL still active): {exc}", flush=True)
+                if self._is_ros_context_shutdown_error(exc):
+                    print(
+                        "[ros2_bridge] ROS2 context closed; publishing stopped (SITL stays active).",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[ros2_bridge] ROS2 publishing disabled (SITL still active): {exc}",
+                        flush=True,
+                    )
             self._ros_ok = False
             return
 
