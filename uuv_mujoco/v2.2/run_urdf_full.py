@@ -209,8 +209,8 @@ def main() -> None:
     parser.add_argument(
         "--thruster-voltage",
         type=float,
-        default=20.0,
-        help="Select nearest thrust curve voltage from performance file (ex. 10,12,14,16,18,20)",
+        default=None,
+        help="Select nearest thrust curve voltage from performance file (ex. 10,12,14,16,18,20). If omitted, use profile value.",
     )
     parser.add_argument(
         "--buoyancy-scale",
@@ -427,6 +427,7 @@ def main() -> None:
             "buoyancy_point_blend": 1.0,
             "align_com_to_thruster_plane": False,
             "cob_y_offset": 0.0,
+            "thruster_voltage": 20.0,
             "thruster_force_max": 65.0,
             "linear_drag": 0.95,
             "angular_drag": 0.10,
@@ -441,14 +442,15 @@ def main() -> None:
         },
         "sim_real": {
             "half_height": 0.147,
-            "buoyancy_scale": 0.996,
+            "buoyancy_scale": 0.992,
             "cob_torque_scale": 1.0,
             "buoyancy_point_blend": 1.0,
             "align_com_to_thruster_plane": False,
-            "cob_y_offset": -0.006,
+            "cob_y_offset": -0.010,
+            "thruster_voltage": 16.0,
             "thruster_force_max": 52.0,
-            "linear_drag": 1.00,
-            "angular_drag": 0.16,
+            "linear_drag": 1.05,
+            "angular_drag": 0.22,
             "spin_gain": 22.0,
             "validation_timestep": 0.005,
             "validation_iterations": 20,
@@ -465,6 +467,7 @@ def main() -> None:
             "buoyancy_point_blend": 1.0,
             "align_com_to_thruster_plane": True,
             "cob_y_offset": -0.015,
+            "thruster_voltage": 16.0,
             "thruster_force_max": 62.0,
             "linear_drag": 0.78,
             "angular_drag": 0.14,
@@ -541,6 +544,19 @@ def main() -> None:
             f"[profile] override buoyancy_scale={sim_profile['buoyancy_scale']:.3f}",
             flush=True,
         )
+    profile_thruster_voltage = float(sim_profile.get("thruster_voltage", 20.0))
+    if args.thruster_voltage is None:
+        active_thruster_voltage = profile_thruster_voltage
+        print(
+            f"[profile] using thruster_voltage={active_thruster_voltage:.1f}V from profile",
+            flush=True,
+        )
+    else:
+        active_thruster_voltage = float(args.thruster_voltage)
+        print(
+            f"[profile] override thruster_voltage={active_thruster_voltage:.1f}V (profile {profile_thruster_voltage:.1f}V)",
+            flush=True,
+        )
 
     validation_threshold_path = Path(args.validation_thresholds).expanduser()
     if not validation_threshold_path.exists():
@@ -563,7 +579,7 @@ def main() -> None:
     # Optional thruster PWM->force profile.
     perf_cfg = {
         "active": False,
-        "requested_voltage": float(args.thruster_voltage),
+        "requested_voltage": float(active_thruster_voltage),
         "selected_voltage": None,
         "pwm": np.array([], dtype=np.float64),
         "force": np.array([], dtype=np.float64),
@@ -584,7 +600,7 @@ def main() -> None:
         try:
             return float(value)
         except (TypeError, ValueError):
-            return float(args.thruster_voltage)
+            return float(active_thruster_voltage)
 
     def _load_thruster_performance(path: Path) -> None:
         perf_path = path.expanduser()
@@ -633,7 +649,7 @@ def main() -> None:
             print(f"[thruster perf] no usable curve in: {perf_path}", flush=True)
             return
 
-        requested = _normalize_thruster_perf_voltage(args.thruster_voltage)
+        requested = _normalize_thruster_perf_voltage(active_thruster_voltage)
         selected = min(candidates, key=lambda item: abs(item["voltage"] - requested))
         perf_cfg.update(
             {

@@ -201,6 +201,7 @@ class Ros2Bridge:
         # Core sensor publishers / ROS2 control channels (optional).
         self.pub_imu = None
         self.pub_dvl_vel = None
+        self.pub_dvl_vel_raw = None
         self.pub_dvl_alt = None
         self.pub_dvl_odom = None
         self.pub_ground_truth = None
@@ -209,6 +210,7 @@ class Ros2Bridge:
         if self._enable_ros:
             self.pub_imu = self.node.create_publisher(self.Imu, "/imu/data", 10)
             self.pub_dvl_vel = self.node.create_publisher(self.TwistStamped, "/dvl/velocity", 10)
+            self.pub_dvl_vel_raw = self.node.create_publisher(self.TwistStamped, "/dvl/velocity_raw", 10)
             self.pub_dvl_alt = self.node.create_publisher(self.Range, "/dvl/altitude", 10)
             self.pub_dvl_odom = self.node.create_publisher(self.Odometry, "/dvl/odometry", 10)
             self.pub_ground_truth = self.node.create_publisher(self.PoseStamped, "/mujoco/ground_truth/pose", 10)
@@ -267,6 +269,11 @@ class Ros2Bridge:
         # Get base body ID for ground truth
         self._base_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
         self._imu_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "imu_site")
+        self._dvl_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "dvl_site")
+        self._dvl_filter_alpha = float(
+            np.clip(self._env_to_float("ROS2_UUV_DVL_LPF_ALPHA", 0.35), 0.0, 1.0)
+        )
+        self._dvl_vel_body_filt = None
 
         self.publish_images = bool(publish_images)
         self.renderers = {}
@@ -309,7 +316,7 @@ class Ros2Bridge:
                     self.cam_info[cname] = default_info
 
         if self._enable_ros:
-            topics_info = "/cmd_vel -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude"
+            topics_info = "/cmd_vel -> control, /imu/data, /dvl/velocity, /dvl/velocity_raw, /dvl/odometry, /dvl/altitude"
             if self.has_mavros and self.enable_mavros:
                 topics_info += ", /mavros/rc/override"
             if self.publish_images:
@@ -946,6 +953,81 @@ class Ros2Bridge:
         n = float(np.linalg.norm(q))
         return q / max(n, 1e-12)
 
+    @staticmethod
+    def _quat_wxyz_to_rotmat(quat: np.ndarray) -> np.ndarray:
+        """Convert quaternion [w, x, y, z] to rotation matrix."""
+        w, x, y, z = quat
+        n = float(np.linalg.norm([w, x, y, z]))
+        if n <= 1e-12:
+            return np.eye(3, dtype=np.float64)
+        w, x, y, z = w / n, x / n, y / n, z / n
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+
+    def _imu_vectors_in_body(
+        self,
+        data: mujoco.MjData,
+        gyro: np.ndarray | None,
+        acc: np.ndarray | None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Transform IMU vectors from imu_site axes to base body axes."""
+        gyro_bmj = np.array(gyro, dtype=np.float64) if gyro is not None else None
+        acc_bmj = np.array(acc, dtype=np.float64) if acc is not None else None
+        if self._base_id < 0 or self._imu_site_id < 0:
+            return gyro_bmj, acc_bmj
+        try:
+            base_rot_enu = data.xmat[self._base_id].reshape(3, 3).copy()
+            imu_rot_enu = data.site_xmat[self._imu_site_id].reshape(3, 3).copy()
+            rot_bmj_imu = base_rot_enu.T @ imu_rot_enu
+            if gyro_bmj is not None:
+                gyro_bmj = rot_bmj_imu @ gyro_bmj
+            if acc_bmj is not None:
+                acc_bmj = rot_bmj_imu @ acc_bmj
+        except Exception:
+            pass
+        return gyro_bmj, acc_bmj
+
+    def _dvl_velocity_body(
+        self,
+        data: mujoco.MjData,
+        dvl_vel_sensor: np.ndarray | None,
+        gyro_bmj: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Return filtered COM linear velocity in base body frame from DVL sensor."""
+        if dvl_vel_sensor is None:
+            return None
+
+        vel_body = np.array(dvl_vel_sensor, dtype=np.float64)
+        if self._base_id >= 0 and self._dvl_site_id >= 0:
+            try:
+                base_rot_enu = data.xmat[self._base_id].reshape(3, 3).copy()
+                dvl_rot_enu = data.site_xmat[self._dvl_site_id].reshape(3, 3).copy()
+                rot_bmj_dvl = base_rot_enu.T @ dvl_rot_enu
+                vel_body = rot_bmj_dvl @ vel_body
+                if gyro_bmj is not None:
+                    r_enu = data.site_xpos[self._dvl_site_id] - data.xpos[self._base_id]
+                    r_body = base_rot_enu.T @ r_enu
+                    vel_body = vel_body - np.cross(gyro_bmj, r_body)
+            except Exception:
+                pass
+
+        vel_body = np.nan_to_num(vel_body, nan=0.0, posinf=0.0, neginf=0.0)
+        alpha = float(self._dvl_filter_alpha)
+        if alpha <= 0.0:
+            self._dvl_vel_body_filt = vel_body
+            return vel_body
+        if self._dvl_vel_body_filt is None:
+            self._dvl_vel_body_filt = vel_body
+        else:
+            self._dvl_vel_body_filt = ((1.0 - alpha) * self._dvl_vel_body_filt) + (alpha * vel_body)
+        return self._dvl_vel_body_filt.copy()
+
     def publish(self, data: mujoco.MjData) -> None:
         """Publish sensors/images at configured rates using simulation time."""
         if self.enable_sitl:
@@ -956,35 +1038,19 @@ class Ros2Bridge:
             return
         self.last_pub_t = sim_t
 
-        # Extract sensor data for both ROS2 and SITL
+        # Extract sensor data for both ROS2 and SITL.
         quat = self._sensor_slice("imu_quat", data)
         gyro = self._sensor_slice("imu_gyro", data)
         acc = self._sensor_slice("imu_acc", data)
-        dvl_vel = self._sensor_slice("dvl_vel_body", data)
-        base_pos = None
-        if self._base_id >= 0:
-            base_pos = data.xpos[self._base_id]
+        dvl_vel_sensor = self._sensor_slice("dvl_vel_body", data)
+        gyro_bmj, acc_bmj = self._imu_vectors_in_body(data, gyro, acc)
+        dvl_vel_body = self._dvl_velocity_body(data, dvl_vel_sensor, gyro_bmj)
 
         # Send to SITL if enabled
-        if self.enable_sitl and self._base_id >= 0 and gyro is not None and acc is not None:
+        if self.enable_sitl and self._base_id >= 0 and gyro_bmj is not None and acc_bmj is not None:
             base_rot_enu = data.xmat[self._base_id].reshape(3, 3).copy()
             base_pos_enu = data.xpos[self._base_id].copy()
             base_vel_enu = data.cvel[self._base_id, 3:6].copy()
-
-            # IMU gyro/acc sensors are expressed in imu_site local axes.
-            # Convert them into base body axes before FRD conversion so
-            # quaternion, gyro, and accel are frame-consistent for EKF.
-            gyro_bmj = np.array(gyro, dtype=np.float64)
-            acc_bmj = np.array(acc, dtype=np.float64)
-            if self._imu_site_id >= 0:
-                try:
-                    imu_rot_enu = data.site_xmat[self._imu_site_id].reshape(3, 3).copy()
-                    rot_bmj_imu = base_rot_enu.T @ imu_rot_enu
-                    gyro_bmj = rot_bmj_imu @ gyro_bmj
-                    acc_bmj = rot_bmj_imu @ acc_bmj
-                except Exception:
-                    # Fallback to raw values if site transform is unavailable.
-                    pass
 
             # Convert vectors/pose to ArduPilot conventions (NED + FRD).
             pos_ned = self._enu_to_ned @ base_pos_enu
@@ -1042,8 +1108,8 @@ class Ros2Bridge:
             # (Already extracted above: quat, gyro, acc, dvl_vel)
             dvl_alt = self._sensor_slice("dvl_altitude", data)
 
-            # Publish IMU
-            if quat is not None and gyro is not None and acc is not None:
+            # Publish IMU (gyro/acc transformed to base body axes).
+            if quat is not None and gyro_bmj is not None and acc_bmj is not None:
                 imu = self.Imu()
                 imu.header.stamp = stamp
                 imu.header.frame_id = "imu_link"
@@ -1052,12 +1118,12 @@ class Ros2Bridge:
                 imu.orientation.x = float(quat[1])
                 imu.orientation.y = float(quat[2])
                 imu.orientation.z = float(quat[3])
-                imu.angular_velocity.x = float(gyro[0])
-                imu.angular_velocity.y = float(gyro[1])
-                imu.angular_velocity.z = float(gyro[2])
-                imu.linear_acceleration.x = float(acc[0])
-                imu.linear_acceleration.y = float(acc[1])
-                imu.linear_acceleration.z = float(acc[2])
+                imu.angular_velocity.x = float(gyro_bmj[0])
+                imu.angular_velocity.y = float(gyro_bmj[1])
+                imu.angular_velocity.z = float(gyro_bmj[2])
+                imu.linear_acceleration.x = float(acc_bmj[0])
+                imu.linear_acceleration.y = float(acc_bmj[1])
+                imu.linear_acceleration.z = float(acc_bmj[2])
                 imu.orientation_covariance[0] = 1e-4
                 imu.orientation_covariance[4] = 1e-4
                 imu.orientation_covariance[8] = 1e-4
@@ -1070,14 +1136,25 @@ class Ros2Bridge:
                 if not _safe_publish(self.pub_imu, imu, "/imu/data"):
                     return
 
-            # Publish DVL velocity
-            if dvl_vel is not None:
+            # Publish DVL raw velocity (sensor frame).
+            if dvl_vel_sensor is not None and self.pub_dvl_vel_raw is not None:
+                tw_raw = self.TwistStamped()
+                tw_raw.header.stamp = stamp
+                tw_raw.header.frame_id = "dvl_link"
+                tw_raw.twist.linear.x = float(dvl_vel_sensor[0])
+                tw_raw.twist.linear.y = float(dvl_vel_sensor[1])
+                tw_raw.twist.linear.z = float(dvl_vel_sensor[2])
+                if not _safe_publish(self.pub_dvl_vel_raw, tw_raw, "/dvl/velocity_raw"):
+                    return
+
+            # Publish DVL velocity corrected to base_link COM/body frame.
+            if dvl_vel_body is not None:
                 tw = self.TwistStamped()
                 tw.header.stamp = stamp
-                tw.header.frame_id = "dvl_link"
-                tw.twist.linear.x = float(dvl_vel[0])
-                tw.twist.linear.y = float(dvl_vel[1])
-                tw.twist.linear.z = float(dvl_vel[2])
+                tw.header.frame_id = "base_link"
+                tw.twist.linear.x = float(dvl_vel_body[0])
+                tw.twist.linear.y = float(dvl_vel_body[1])
+                tw.twist.linear.z = float(dvl_vel_body[2])
                 if not _safe_publish(self.pub_dvl_vel, tw, "/dvl/velocity"):
                     return
 
@@ -1095,22 +1172,18 @@ class Ros2Bridge:
                 if not _safe_publish(self.pub_dvl_alt, rg, "/dvl/altitude"):
                     return
 
-            # Publish DVL Odometry (integrated from velocity)
-            if dvl_vel is not None and quat is not None:
-                dt = self.sensor_dt
-                yaw = self._quat_to_yaw(quat)
-                
-                # Integrate velocity in world frame
-                cos_yaw = np.cos(yaw)
-                sin_yaw = np.sin(yaw)
-                vx_world = dvl_vel[0] * cos_yaw - dvl_vel[1] * sin_yaw
-                vy_world = dvl_vel[0] * sin_yaw + dvl_vel[1] * cos_yaw
-                vz_world = dvl_vel[2]
-                
-                self._odom_pos[0] += vx_world * dt
-                self._odom_pos[1] += vy_world * dt
-                self._odom_pos[2] += vz_world * dt
-                self._odom_yaw = yaw
+            # Publish DVL odometry (integrated from corrected body velocity).
+            if dvl_vel_body is not None and quat is not None:
+                if self._last_odom_time < 0.0:
+                    dt = self.sensor_dt
+                else:
+                    dt = float(np.clip(sim_t - self._last_odom_time, 1e-4, 0.2))
+                self._last_odom_time = sim_t
+
+                rot_world_body = self._quat_wxyz_to_rotmat(np.array(quat, dtype=np.float64))
+                vel_world = rot_world_body @ np.array(dvl_vel_body, dtype=np.float64)
+                self._odom_pos += vel_world * dt
+                self._odom_yaw = self._quat_to_yaw(np.array(quat, dtype=np.float64))
 
                 odom = self.Odometry()
                 odom.header.stamp = stamp
@@ -1123,11 +1196,22 @@ class Ros2Bridge:
                 odom.pose.pose.orientation.x = float(quat[1])
                 odom.pose.pose.orientation.y = float(quat[2])
                 odom.pose.pose.orientation.z = float(quat[3])
-                odom.twist.twist.linear.x = float(dvl_vel[0])
-                odom.twist.twist.linear.y = float(dvl_vel[1])
-                odom.twist.twist.linear.z = float(dvl_vel[2])
+                odom.twist.twist.linear.x = float(dvl_vel_body[0])
+                odom.twist.twist.linear.y = float(dvl_vel_body[1])
+                odom.twist.twist.linear.z = float(dvl_vel_body[2])
+                odom.pose.covariance[0] = 0.03
+                odom.pose.covariance[7] = 0.03
+                odom.pose.covariance[14] = 0.06
+                odom.pose.covariance[21] = 0.08
+                odom.pose.covariance[28] = 0.08
+                odom.pose.covariance[35] = 0.04
+                odom.twist.covariance[0] = 0.02
+                odom.twist.covariance[7] = 0.02
+                odom.twist.covariance[14] = 0.03
                 if not _safe_publish(self.pub_dvl_odom, odom, "/dvl/odometry"):
                     return
+            elif dvl_vel_body is None:
+                self._last_odom_time = -1.0
 
             # Publish ground truth pose from MuJoCo
             if self._base_id >= 0:
