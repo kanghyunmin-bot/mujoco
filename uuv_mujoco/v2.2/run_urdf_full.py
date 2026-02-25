@@ -371,13 +371,13 @@ def main() -> None:
     parser.add_argument(
         "--sitl-servo-map",
         type=str,
-        default="auto",
+        default="yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr",
         help="Comma-separated thruster names mapped from SITL servo outputs 1..N, or 'auto' for mixer-inverse mode.",
     )
     parser.add_argument(
         "--sitl-servo-signs",
         type=str,
-        default="auto",
+        default="1,1,1,1,1,1,1,1",
         help="Comma-separated sign multipliers for --sitl-servo-map entries, or 'auto'.",
     )
     parser.add_argument(

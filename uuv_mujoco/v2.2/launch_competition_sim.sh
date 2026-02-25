@@ -121,6 +121,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+extra_arg_present() {
+    local needle="$1"
+    local token
+    for token in "${EXTRA_ARGS[@]}"; do
+        if [[ "$token" == "$needle" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 collect_existing_mujoco_pids() {
     ps -eo pid=,args= | awk '
         index($0, "run_urdf_full.py --scene competition_scene.xml") > 0 { print $1 }
@@ -206,6 +217,24 @@ if [[ -n "$SITL_ARG" ]]; then
         # Prevent accidental local joystick noise from overriding SITL inputs.
         EXTRA_ARGS+=(--disable-joystick)
         echo "[launch] SITL mode: local /dev/input joystick disabled (use --allow-local-joystick to override)."
+    fi
+    # Stabilize/Manual in ArduSub are significantly more robust when MuJoCo
+    # consumes direct per-motor PWM (instead of mixer-inverse reconstruction).
+    # Apply a safe default map unless user explicitly overrides SITL motor routing.
+    if ! extra_arg_present "--sitl-servo-map" \
+        && ! extra_arg_present "--sitl-servo-signs" \
+        && ! extra_arg_present "--no-sitl-direct-thrusters" \
+        && ! extra_arg_present "--sitl-mixer-frame"; then
+        EXTRA_ARGS+=(
+            --sitl-servo-map "yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr"
+            --sitl-servo-signs "1,1,1,1,1,1,1,1"
+        )
+        echo "[launch] SITL mode: defaulting to direct thruster map (ch1..8 -> yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr)."
+    fi
+    # Raise SITL sensor feed rate by default to reduce EKF lag in stabilize mode.
+    if ! extra_arg_present "--ros2-sensor-hz"; then
+        EXTRA_ARGS+=(--ros2-sensor-hz 200)
+        echo "[launch] SITL mode: overriding sensor publish rate to 200 Hz (use --ros2-sensor-hz to set manually)."
     fi
 fi
 
