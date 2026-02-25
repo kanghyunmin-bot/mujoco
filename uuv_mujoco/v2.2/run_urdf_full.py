@@ -1743,16 +1743,15 @@ def main() -> None:
                 if len(pwm_values) >= 8:
                     p7 = int(pwm_values[6])
                     p8 = int(pwm_values[7])
-                    n7 = sitl_pwm_to_norm(p7)
-                    n8 = sitl_pwm_to_norm(p8)
-                    if p7 <= 0 or p8 <= 0:
-                        sitl_mixer_frame_locked["value"] = "vectored"
-                    elif abs(n7) > 0.05 or abs(n8) > 0.05:
-                        sitl_mixer_frame_locked["value"] = "vectored_6dof"
-                if sitl_mixer_frame_locked["value"] is None:
-                    # Conservative default: avoid depending on channels 7/8 unless confirmed.
-                    return "vectored"
-                return str(sitl_mixer_frame_locked["value"])
+                    # Do not permanently lock to vectored from startup zeros.
+                    # ArduSub often publishes ch7/ch8 as 0 while disarmed and only
+                    # drives valid PWM (1100..1900) after arm/mode transitions.
+                    valid7 = 1000 <= p7 <= 2000
+                    valid8 = 1000 <= p8 <= 2000
+                    if valid7 and valid8:
+                        return "vectored_6dof"
+                # Conservative fallback until 7/8 are confirmed active.
+                return "vectored"
 
             def on_sitl_servo_packet(pwm_values: list[int]) -> None:
                 frame_name = resolve_mixer_frame(pwm_values)
