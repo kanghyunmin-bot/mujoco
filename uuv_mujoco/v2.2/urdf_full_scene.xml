@@ -1,6 +1,6 @@
 <mujoco model="urdf_full">
   <!-- v2.1 baseline scene: pool environment + full ROV mesh + 8 thrusters -->
-  <compiler angle="radian" meshdir="assets/urdf_full/meshes_split/" settotalmass="10" />
+  <compiler angle="radian" meshdir="assets/urdf_full/meshes_split/" />
 
   <!-- Keep global medium as air; underwater behavior is modeled in runtime code. -->
   <option density="1.225" viscosity="1.8e-05" integrator="implicitfast" />

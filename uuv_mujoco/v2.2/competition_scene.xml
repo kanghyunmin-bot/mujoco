@@ -1,6 +1,6 @@
 <mujoco model="competition_scene">
   <!-- Competition environment: pool + ROV + buoys + QR panels -->
-  <compiler angle="radian" meshdir="assets/urdf_full/meshes_split/" settotalmass="10" />
+  <compiler angle="radian" meshdir="assets/urdf_full/meshes_split/" />
 
   <option density="1000" viscosity="0.001" integrator="implicitfast" />
 

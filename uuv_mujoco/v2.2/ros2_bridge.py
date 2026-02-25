@@ -49,6 +49,8 @@ class Ros2Bridge:
         sitl_heave_sign: float = 1.0,
         sitl_cmd_scale: float = 1.0,
         sitl_command_debug: bool = False,
+        sitl_servo_callback: Optional[Callable[[list[int]], None]] = None,
+        sitl_axis_control: bool = True,
         camera_calib_left: str = "",
         camera_calib_right: str = "",
         enable_ros: bool = True,
@@ -147,12 +149,18 @@ class Ros2Bridge:
         self._sitl_last_send_err_wall = -1.0
         self._sitl_last_no_client_wall = -1.0
         self._sitl_send_counter = 0
+        self._sitl_first_servo_wall = -1.0
+        self._sitl_last_nonneutral_servo_wall = -1.0
+        self._sitl_last_neutral_warn_wall = -1.0
         self._sitl_last_nonzero_cmd = None
         self._sitl_nonfinite_warned = False
         self._sitl_t0_wall = None
         self._sitl_cmd_debug = bool(sitl_command_debug)
+        self._sitl_servo_callback = sitl_servo_callback
+        self._sitl_axis_control = bool(sitl_axis_control)
         self._sitl_last_cmd_log = -1.0
         self._sitl_last_cmd_nonzero = None
+        self._sitl_last_servo_pkt = None
         self._sitl_cmd_scale = max(0.0, float(sitl_cmd_scale))
         self._sitl_cmd_sign = np.array(
             [
@@ -220,17 +228,17 @@ class Ros2Bridge:
         # MAVLink RC input order is Roll(1), Pitch(2), Throttle(3), Yaw(4).
         # Zero-based indices are used below.
         self._ch_forward = self._env_to_int("ROS2_UUV_RC_CH_FORWARD", int(sitl_ch_forward))
-        self._ch_lateral = self._env_to_int("ROS2_UUV_RC_CH_LATERAL", int(sitl_lateral))
-        self._ch_throttle = self._env_to_int("ROS2_UUV_RC_CH_THROTTLE", int(sitl_throttle))
-        self._ch_yaw = self._env_to_int("ROS2_UUV_RC_CH_YAW", int(sitl_yaw))
+        self._ch_lateral = self._env_to_int("ROS2_UUV_RC_CH_LATERAL", int(sitl_ch_lateral))
+        self._ch_throttle = self._env_to_int("ROS2_UUV_RC_CH_THROTTLE", int(sitl_ch_throttle))
+        self._ch_yaw = self._env_to_int("ROS2_UUV_RC_CH_YAW", int(sitl_ch_yaw))
         # Optional SITL environment overrides for command sign/scale (kept compatible
         # with CLI args above for easier calibration while debugging).
         self._sitl_cmd_sign = np.array(
             [
-                self._env_to_float("ROS2_UUV_SITL_FORWARD_SIGN", float(sitl_cmd_sign[0])),
-                self._env_to_float("ROS2_UUV_SITL_LATERAL_SIGN", float(sitl_cmd_sign[1])),
-                self._env_to_float("ROS2_UUV_SITL_YAW_SIGN", float(sitl_cmd_sign[2])),
-                self._env_to_float("ROS2_UUV_SITL_HEAVE_SIGN", float(sitl_cmd_sign[3])),
+                self._env_to_float("ROS2_UUV_SITL_FORWARD_SIGN", float(sitl_forward_sign)),
+                self._env_to_float("ROS2_UUV_SITL_LATERAL_SIGN", float(sitl_lateral_sign)),
+                self._env_to_float("ROS2_UUV_SITL_YAW_SIGN", float(sitl_yaw_sign)),
+                self._env_to_float("ROS2_UUV_SITL_HEAVE_SIGN", float(sitl_heave_sign)),
             ],
             dtype=np.float64,
         )
@@ -257,6 +265,7 @@ class Ros2Bridge:
 
         # Get base body ID for ground truth
         self._base_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+        self._imu_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "imu_site")
 
         self.publish_images = bool(publish_images)
         self.renderers = {}
@@ -356,6 +365,17 @@ class Ros2Bridge:
             float(mapped[3]),
         )
 
+    def set_sitl_servo_handler(
+        self,
+        callback: Optional[Callable[[list[int]], None]],
+        axis_control: bool = True,
+    ) -> None:
+        """Set raw SITL servo callback and whether axis remapping is enabled."""
+        self._sitl_servo_callback = callback
+        self._sitl_axis_control = bool(axis_control)
+        mode = "axis+servo" if self._sitl_axis_control else "servo-direct"
+        print(f"[ros2_bridge] SITL control mode set: {mode}", flush=True)
+
     def _handle_normalized_cmd(
         self,
         fwd_norm: float,
@@ -411,7 +431,7 @@ class Ros2Bridge:
             self.sitl_sock.setblocking(False)
             sock_addr = self.sitl_sock.getsockname()
             print(
-                f"[ros2_bridge] SITL socket initialized (listen {sock_addr}, default target {self.sitl_addr})",
+                f"[ros2_bridge] SITL socket initialized (listen {sock_addr}, servo_target={self.sitl_addr}, sensor_target={self.sitl_send_addr})",
                 flush=True,
             )
         except Exception as e:
@@ -455,6 +475,8 @@ class Ros2Bridge:
             # Keep last-received wall time updated on every packet to avoid
             # emitting false stale warnings when the source port is stable.
             self._sitl_client_last_wall = time.monotonic()
+            if self._sitl_first_servo_wall <= 0.0:
+                self._sitl_first_servo_wall = self._sitl_client_last_wall
             self._sitl_last_command_stale_wall = -1.0
             got_any = True
 
@@ -466,6 +488,59 @@ class Ros2Bridge:
             try:
                 pwm_values = list(struct.unpack_from("<16H" if magic == 18458 else "<32H", pkt, 8))
             except struct.error:
+                continue
+
+            # Track whether incoming servo stream is actively commanded or stuck at neutral.
+            # This is the most common root-cause when QGC appears connected but the vehicle
+            # does not move (disarmed/manual input not flowing).
+            pwm_head = pwm_values[:8]
+            nonneutral = False
+            valid_pwm = []
+            for value in pwm_head:
+                iv = int(value)
+                if iv <= 0 or iv == 65535:
+                    continue
+                valid_pwm.append(iv)
+                if abs(iv - 1500) > 12:
+                    nonneutral = True
+                    break
+            if nonneutral:
+                self._sitl_last_nonneutral_servo_wall = now_wall
+            elif self._sitl_client_addr is not None:
+                since_nonneutral = (
+                    now_wall - self._sitl_last_nonneutral_servo_wall
+                    if self._sitl_last_nonneutral_servo_wall > 0.0
+                    else now_wall - self._sitl_first_servo_wall
+                )
+                if since_nonneutral > 3.0 and now_wall - self._sitl_last_neutral_warn_wall > 3.0:
+                    if not valid_pwm:
+                        print(
+                            "[ros2_bridge] SITL servo stream has no active outputs (all 0/65535). "
+                            "Check: vehicle ARM state and JSON sensor stream health.",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[ros2_bridge] SITL servo stream is neutral (all near 1500). "
+                            "Check: vehicle ARM state, QGC joystick enabled, MANUAL mode.",
+                            flush=True,
+                        )
+                    self._sitl_last_neutral_warn_wall = now_wall
+
+            if self._sitl_servo_callback is not None:
+                try:
+                    self._sitl_servo_callback(pwm_values)
+                except Exception as exc:
+                    print(f"[ros2_bridge] SITL servo callback failed: {exc}", flush=True)
+
+            if not self._sitl_axis_control:
+                if self._sitl_cmd_debug:
+                    now = time.monotonic()
+                    pkt8 = tuple(int(v) for v in pwm_values[:8])
+                    if (self._sitl_last_servo_pkt != pkt8) and (now - self._sitl_last_cmd_log > 0.15):
+                        print(f"[ros2_bridge] SITL servo pwm[1..8]={pkt8}", flush=True)
+                        self._sitl_last_cmd_log = now
+                        self._sitl_last_servo_pkt = pkt8
                 continue
 
             if len(pwm_values) <= max(self._ch_forward, self._ch_lateral, self._ch_throttle, self._ch_yaw):
@@ -875,11 +950,26 @@ class Ros2Bridge:
             base_pos_enu = data.xpos[self._base_id].copy()
             base_vel_enu = data.cvel[self._base_id, 3:6].copy()
 
+            # IMU gyro/acc sensors are expressed in imu_site local axes.
+            # Convert them into base body axes before FRD conversion so
+            # quaternion, gyro, and accel are frame-consistent for EKF.
+            gyro_bmj = np.array(gyro, dtype=np.float64)
+            acc_bmj = np.array(acc, dtype=np.float64)
+            if self._imu_site_id >= 0:
+                try:
+                    imu_rot_enu = data.site_xmat[self._imu_site_id].reshape(3, 3).copy()
+                    rot_bmj_imu = base_rot_enu.T @ imu_rot_enu
+                    gyro_bmj = rot_bmj_imu @ gyro_bmj
+                    acc_bmj = rot_bmj_imu @ acc_bmj
+                except Exception:
+                    # Fallback to raw values if site transform is unavailable.
+                    pass
+
             # Convert vectors/pose to ArduPilot conventions (NED + FRD).
             pos_ned = self._enu_to_ned @ base_pos_enu
             vel_ned = self._enu_to_ned @ base_vel_enu
-            gyro_frd = self._bmj_to_frd @ gyro
-            acc_frd = self._bmj_to_frd @ acc
+            gyro_frd = self._bmj_to_frd @ gyro_bmj
+            acc_frd = self._bmj_to_frd @ acc_bmj
 
             rot_ned_bfrd = self._enu_to_ned @ base_rot_enu @ self._bmj_to_frd.T
             quat_ned_bfrd = self._rotmat_to_quat_wxyz(rot_ned_bfrd)

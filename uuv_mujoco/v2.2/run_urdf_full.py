@@ -213,6 +213,12 @@ def main() -> None:
         help="Select nearest thrust curve voltage from performance file (ex. 10,12,14,16,18,20)",
     )
     parser.add_argument(
+        "--buoyancy-scale",
+        type=float,
+        default=None,
+        help="Override profile buoyancy scale at runtime (ex. 0.98 for weaker buoyancy).",
+    )
+    parser.add_argument(
         "--disable-thruster-perf",
         action="store_true",
         help="Force linear thruster mapping and ignore performance curve JSON",
@@ -351,6 +357,55 @@ def main() -> None:
         help="Print SITL channel->command conversion diagnostics.",
     )
     parser.add_argument(
+        "--sitl-direct-thrusters",
+        dest="sitl_direct_thrusters",
+        action="store_true",
+        help="Use ArduSub servo PWM as direct per-thruster commands (recommended in --sitl).",
+    )
+    parser.add_argument(
+        "--no-sitl-direct-thrusters",
+        dest="sitl_direct_thrusters",
+        action="store_false",
+        help="Disable direct per-thruster mapping and use legacy axis remapping.",
+    )
+    parser.add_argument(
+        "--sitl-servo-map",
+        type=str,
+        default="auto",
+        help="Comma-separated thruster names mapped from SITL servo outputs 1..N, or 'auto' for mixer-inverse mode.",
+    )
+    parser.add_argument(
+        "--sitl-servo-signs",
+        type=str,
+        default="auto",
+        help="Comma-separated sign multipliers for --sitl-servo-map entries, or 'auto'.",
+    )
+    parser.add_argument(
+        "--sitl-servo-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to direct-thruster normalized command from SITL PWM.",
+    )
+    parser.add_argument(
+        "--sitl-roll-scale",
+        type=float,
+        default=0.45,
+        help="Additional scale for roll command in SITL mixer-inverse mode.",
+    )
+    parser.add_argument(
+        "--sitl-pitch-scale",
+        type=float,
+        default=0.45,
+        help="Additional scale for pitch command in SITL mixer-inverse mode.",
+    )
+    parser.add_argument(
+        "--sitl-mixer-frame",
+        type=str,
+        default="auto",
+        choices=("auto", "vectored", "vectored_6dof"),
+        help="Frame for SITL mixer-inverse mode when --sitl-servo-map=auto (default: auto detect).",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run real-time simulation loop without GLFW viewer",
@@ -360,6 +415,7 @@ def main() -> None:
         action="store_true",
         help="Allow /mavros/rc/override input even in --sitl mode (default: disabled in SITL)",
     )
+    parser.set_defaults(sitl_direct_thrusters=True)
     args = parser.parse_args()
 
     # Profile values are externalized so users can retune dynamics without code edits.
@@ -479,6 +535,12 @@ def main() -> None:
 
     sim_profile = dict(profiles[args.profile])
     print(f"[profile] using '{args.profile}' from {profile_path}", flush=True)
+    if args.buoyancy_scale is not None:
+        sim_profile["buoyancy_scale"] = float(np.clip(args.buoyancy_scale, 0.0, 2.0))
+        print(
+            f"[profile] override buoyancy_scale={sim_profile['buoyancy_scale']:.3f}",
+            flush=True,
+        )
 
     validation_threshold_path = Path(args.validation_thresholds).expanduser()
     if not validation_threshold_path.exists():
@@ -604,6 +666,27 @@ def main() -> None:
 
     # Identify base body
     base_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
+    if base_id < 0:
+        raise SystemExit("[runtime] base_link body not found in model")
+
+    # Build body-child table once so subtree mass can be computed robustly.
+    body_children = [[] for _ in range(model.nbody)]
+    for body_idx in range(1, model.nbody):
+        parent_idx = int(model.body_parentid[body_idx])
+        if 0 <= parent_idx < model.nbody:
+            body_children[parent_idx].append(body_idx)
+
+    def body_subtree_mass(root_body_id: int) -> float:
+        """Return total mass of the given body and all descendants."""
+        if not (0 <= root_body_id < model.nbody):
+            return 0.0
+        total = 0.0
+        stack = [int(root_body_id)]
+        while stack:
+            bid = stack.pop()
+            total += float(model.body_mass[bid])
+            stack.extend(body_children[bid])
+        return total
 
     # Actuator indices
     act = {
@@ -1558,8 +1641,17 @@ def main() -> None:
     water_surface_z = 0.0
     rho = float(model.opt.density)
     g = abs(float(model.opt.gravity[2]))
-    total_mass = float(np.sum(model.body_mass[1:]))
-    neutral_volume = total_mass / max(rho, 1e-6)
+    total_mass_all = float(np.sum(model.body_mass[1:]))
+    vehicle_mass = body_subtree_mass(base_id)
+    if vehicle_mass <= 1e-9:
+        vehicle_mass = float(model.body_mass[base_id])
+    neutral_volume = vehicle_mass / max(rho, 1e-6)
+    if total_mass_all > vehicle_mass * 1.2:
+        print(
+            "[physics] buoyancy mass reference: "
+            f"vehicle_subtree={vehicle_mass:.3f}kg (all_nonworld={total_mass_all:.3f}kg)",
+            flush=True,
+        )
 
     all_thruster_names = ver_names + yaw_names
     thr_state = {name: 0.0 for name in all_thruster_names}
@@ -1577,6 +1669,197 @@ def main() -> None:
             prop_dof_adr[name] = int(model.jnt_dofadr[jid])
             # Alternate rotation direction for a more natural visual.
             prop_spin_sign[name] = 1.0 if name.endswith(("lf", "rr")) else -1.0
+
+    sitl_direct_thrusters = bool(args.sitl and args.sitl_direct_thrusters)
+    sitl_servo_cmd_norm = {name: 0.0 for name in all_thruster_names}
+    sitl_servo_last_wall = {"value": -1.0}
+    sitl_servo_timeout_s = 0.8
+    sitl_servo_scale = float(np.clip(args.sitl_servo_scale, 0.0, 2.0))
+    sitl_roll_scale = float(np.clip(args.sitl_roll_scale, 0.0, 2.0))
+    sitl_pitch_scale = float(np.clip(args.sitl_pitch_scale, 0.0, 2.0))
+    sitl_use_mixer_inverse = False
+    sitl_mixer_cmd = {
+        "roll": 0.0,
+        "pitch": 0.0,
+        "yaw": 0.0,
+        "throttle": 0.0,
+        "forward": 0.0,
+        "lateral": 0.0,
+    }
+    sitl_mixer_frame_locked = {"value": None}
+    sitl_mixer_last_cmd = {"value": None}
+    sitl_mixer_last_log = {"value": -1.0}
+
+    # ArduSub AP_Motors6DOF motor factors (roll, pitch, yaw, throttle, forward, lateral).
+    sitl_motor_mix = {
+        "vectored": np.array(
+            [
+                [0.0, 0.0, 1.0, 0.0, -1.0, 1.0],
+                [0.0, 0.0, -1.0, 0.0, -1.0, -1.0],
+                [0.0, 0.0, -1.0, 0.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0, 0.0, 1.0, -1.0],
+                [1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0, -1.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        "vectored_6dof": np.array(
+            [
+                [0.0, 0.0, 1.0, 0.0, -1.0, 1.0],
+                [0.0, 0.0, -1.0, 0.0, -1.0, -1.0],
+                [0.0, 0.0, -1.0, 0.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0, 0.0, 1.0, -1.0],
+                [1.0, -1.0, 0.0, -1.0, 0.0, 0.0],
+                [-1.0, -1.0, 0.0, -1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0, -1.0, 0.0, 0.0],
+                [-1.0, 1.0, 0.0, -1.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+    }
+    sitl_motor_mix_pinv = {
+        name: np.linalg.pinv(mat) for name, mat in sitl_motor_mix.items()
+    }
+
+    def sitl_pwm_to_norm(pwm: int) -> float:
+        # ArduSub bidirectional motor range: 1100..1900, neutral=1500.
+        if pwm <= 0 or pwm == 65535:
+            return 0.0
+        return float(np.clip((float(pwm) - 1500.0) / 400.0, -1.0, 1.0))
+
+    if sitl_direct_thrusters:
+        servo_map_arg = str(args.sitl_servo_map).strip()
+        sitl_use_mixer_inverse = servo_map_arg.lower() == "auto"
+
+        if sitl_use_mixer_inverse:
+            forced_frame = str(args.sitl_mixer_frame).strip().lower()
+
+            def resolve_mixer_frame(pwm_values: list[int]) -> str:
+                if sitl_mixer_frame_locked["value"] in ("vectored", "vectored_6dof"):
+                    return str(sitl_mixer_frame_locked["value"])
+                if forced_frame in ("vectored", "vectored_6dof"):
+                    sitl_mixer_frame_locked["value"] = forced_frame
+                    return forced_frame
+                if len(pwm_values) >= 8:
+                    p7 = int(pwm_values[6])
+                    p8 = int(pwm_values[7])
+                    n7 = sitl_pwm_to_norm(p7)
+                    n8 = sitl_pwm_to_norm(p8)
+                    if p7 <= 0 or p8 <= 0:
+                        sitl_mixer_frame_locked["value"] = "vectored"
+                    elif abs(n7) > 0.05 or abs(n8) > 0.05:
+                        sitl_mixer_frame_locked["value"] = "vectored_6dof"
+                if sitl_mixer_frame_locked["value"] is None:
+                    # Conservative default: avoid depending on channels 7/8 unless confirmed.
+                    return "vectored"
+                return str(sitl_mixer_frame_locked["value"])
+
+            def on_sitl_servo_packet(pwm_values: list[int]) -> None:
+                frame_name = resolve_mixer_frame(pwm_values)
+                mix = sitl_motor_mix[frame_name]
+                pinv = sitl_motor_mix_pinv[frame_name]
+                motors = np.zeros(mix.shape[0], dtype=np.float64)
+                n = min(len(pwm_values), mix.shape[0])
+                for i in range(n):
+                    motors[i] = sitl_pwm_to_norm(int(pwm_values[i]))
+                cmd = pinv @ motors
+                cmd = np.clip(
+                    np.nan_to_num(cmd, nan=0.0, posinf=1.0, neginf=-1.0),
+                    -1.0,
+                    1.0,
+                )
+                sitl_mixer_cmd["roll"] = float(cmd[0])
+                sitl_mixer_cmd["pitch"] = float(cmd[1])
+                sitl_mixer_cmd["yaw"] = float(cmd[2])
+                sitl_mixer_cmd["throttle"] = float(cmd[3])
+                sitl_mixer_cmd["forward"] = float(cmd[4])
+                # ArduSub lateral(+right) and this model's sway axis are opposite.
+                sitl_mixer_cmd["lateral"] = float(-cmd[5])
+                sitl_servo_last_wall["value"] = time.monotonic()
+                if args.sitl_command_debug:
+                    now = time.monotonic()
+                    packed = (
+                        frame_name,
+                        round(sitl_mixer_cmd["forward"], 3),
+                        round(sitl_mixer_cmd["lateral"], 3),
+                        round(sitl_mixer_cmd["yaw"], 3),
+                        round(sitl_mixer_cmd["throttle"], 3),
+                        round(sitl_mixer_cmd["roll"], 3),
+                        round(sitl_mixer_cmd["pitch"], 3),
+                    )
+                    if packed != sitl_mixer_last_cmd["value"] and (now - sitl_mixer_last_log["value"]) > 0.15:
+                        print(
+                            "[sitl] mixer decode "
+                            f"[{frame_name}] fwd={sitl_mixer_cmd['forward']:+.3f} "
+                            f"lat={sitl_mixer_cmd['lateral']:+.3f} yaw={sitl_mixer_cmd['yaw']:+.3f} "
+                            f"thr={sitl_mixer_cmd['throttle']:+.3f} "
+                            f"roll={sitl_mixer_cmd['roll']:+.3f} pitch={sitl_mixer_cmd['pitch']:+.3f}",
+                            flush=True,
+                        )
+                        sitl_mixer_last_cmd["value"] = packed
+                        sitl_mixer_last_log["value"] = now
+
+            if ros_bridge is not None:
+                ros_bridge.set_sitl_servo_handler(on_sitl_servo_packet, axis_control=False)
+            print(
+                "[sitl] mixer-inverse mode enabled: "
+                f"frame={args.sitl_mixer_frame}, servo-scale={sitl_servo_scale:.2f}, "
+                f"roll-scale={sitl_roll_scale:.2f}, pitch-scale={sitl_pitch_scale:.2f}",
+                flush=True,
+            )
+        else:
+            raw_map = [token.strip() for token in servo_map_arg.split(",") if token.strip()]
+            if not raw_map:
+                raise SystemExit("[runtime] --sitl-servo-map is empty")
+            if len(raw_map) > 16:
+                raise SystemExit("[runtime] --sitl-servo-map supports up to 16 channels")
+            for thr_name in raw_map:
+                if thr_name not in all_thruster_names:
+                    raise SystemExit(
+                        f"[runtime] invalid thruster in --sitl-servo-map: {thr_name} "
+                        f"(valid: {','.join(all_thruster_names)})"
+                    )
+
+            servo_sign_arg = str(args.sitl_servo_signs).strip().lower()
+            if servo_sign_arg == "auto":
+                servo_signs = [1.0 for _ in raw_map]
+            else:
+                sign_tokens = [token.strip() for token in str(args.sitl_servo_signs).split(",") if token.strip()]
+                if not sign_tokens:
+                    servo_signs = [1.0 for _ in raw_map]
+                elif len(sign_tokens) == 1:
+                    servo_signs = [float(sign_tokens[0]) for _ in raw_map]
+                elif len(sign_tokens) == len(raw_map):
+                    servo_signs = [float(token) for token in sign_tokens]
+                else:
+                    raise SystemExit(
+                        "[runtime] --sitl-servo-signs must have 1 value or match --sitl-servo-map length"
+                    )
+            servo_signs = [float(np.sign(v)) if abs(float(v)) > 1e-9 else 1.0 for v in servo_signs]
+
+            def on_sitl_servo_packet(pwm_values: list[int]) -> None:
+                for thr_name in all_thruster_names:
+                    sitl_servo_cmd_norm[thr_name] = 0.0
+                for idx, thr_name in enumerate(raw_map):
+                    if idx >= len(pwm_values):
+                        break
+                    norm = sitl_pwm_to_norm(int(pwm_values[idx])) * servo_signs[idx]
+                    sitl_servo_cmd_norm[thr_name] = float(np.clip(norm, -1.0, 1.0))
+                sitl_servo_last_wall["value"] = time.monotonic()
+
+            if ros_bridge is not None:
+                ros_bridge.set_sitl_servo_handler(on_sitl_servo_packet, axis_control=False)
+            print(
+                "[sitl] direct thruster mode enabled: "
+                + ", ".join(
+                    f"ch{idx + 1}->{thr_name}*{servo_signs[idx]:+0.0f}"
+                    for idx, thr_name in enumerate(raw_map)
+                )
+                + f", servo-scale={sitl_servo_scale:.2f}",
+                flush=True,
+            )
+    elif args.sitl:
+        print("[sitl] using legacy axis remapping mode (not direct-thruster).", flush=True)
 
     def ensure_thruster_params_file() -> None:
         if thruster_params_path.exists():
@@ -1646,12 +1929,21 @@ def main() -> None:
         np.clip(sim_profile.get("air_angular_drag", angular_drag * 0.05), 0.0, angular_drag)
     )
     spin_gain = float(sim_profile.get("spin_gain", 22.0))
+    print(
+        "[physics] buoyancy setup: "
+        f"scale={buoyancy_scale:.3f}, mass={vehicle_mass:.3f}kg, "
+        f"rho={rho:.1f}, neutral_volume={neutral_volume:.5f}m^3, half_height={half_height:.3f}",
+        flush=True,
+    )
 
-    # Vertical allocator for roll/pitch stabilization using vertical thrusters.
+    # Vertical allocators for roll/pitch control via vertical thrusters.
+    # - vert_pinv: physical torque-domain inverse (used by IMU stabilization)
+    # - vert_att_pinv: normalized command-domain inverse (used by SITL mixer decode)
     vert_pinv = np.zeros((len(ver_names), 2), dtype=np.float64)
+    vert_att_pinv = np.zeros((len(ver_names), 2), dtype=np.float64)
 
     def build_vertical_allocator() -> None:
-        nonlocal vert_pinv
+        nonlocal vert_pinv, vert_att_pinv
         com_body = model.body_ipos[base_id].copy()
         alloc = np.zeros((2, len(ver_names)), dtype=np.float64)
         for i, name in enumerate(ver_names):
@@ -1666,8 +1958,22 @@ def main() -> None:
             alloc[:, i] = np.array([tau[0], tau[2]], dtype=np.float64)
         if alloc.shape[1] > 0:
             vert_pinv = np.linalg.pinv(alloc)
+            row_scale = np.sum(np.abs(alloc), axis=1)
+            row_scale = np.where(row_scale < 1e-6, 1.0, row_scale)
+            vert_att_pinv = np.linalg.pinv(alloc / row_scale[:, None])
 
     build_vertical_allocator()
+
+    def mix_vertical_attitude_cmd(roll_cmd: float, pitch_cmd: float) -> np.ndarray:
+        """Map normalized roll/pitch commands into vertical thruster commands."""
+        if not vert_att_pinv.size:
+            return np.zeros(len(ver_names), dtype=np.float64)
+        cmd = np.array([roll_cmd, pitch_cmd], dtype=np.float64)
+        u = vert_att_pinv @ cmd
+        max_abs = float(np.max(np.abs(u))) if u.size else 0.0
+        if max_abs > 1.0:
+            u = u / max_abs
+        return np.clip(u, -1.0, 1.0)
 
     def update_horizontal_stab_gain() -> None:
         """Recompute normalized yaw correction gain from allocator and thrust limit."""
@@ -2342,6 +2648,78 @@ def main() -> None:
                 print(f"[ros2] spin_once failed, disabling bridge: {exc}", flush=True)
                 ros_bridge.shutdown()
                 ros_bridge = None
+
+        if sitl_direct_thrusters:
+            now = time.monotonic()
+            stale = (
+                sitl_servo_last_wall["value"] <= 0.0
+                or (now - sitl_servo_last_wall["value"]) > sitl_servo_timeout_s
+            )
+            if stale:
+                for name in all_thruster_names:
+                    thr_target[name] = 0.0
+            else:
+                if sitl_use_mixer_inverse:
+                    fwd_cmd = float(
+                        np.clip(sitl_mixer_cmd["forward"] * sitl_servo_scale, -1.0, 1.0)
+                    )
+                    sway_cmd = float(
+                        np.clip(sitl_mixer_cmd["lateral"] * sitl_servo_scale, -1.0, 1.0)
+                    )
+                    yaw_cmd = float(
+                        np.clip(sitl_mixer_cmd["yaw"] * sitl_servo_scale, -1.0, 1.0)
+                    )
+                    # ArduSub throttle factor is negative in vectored frames,
+                    # while this model's positive vertical command pushes down.
+                    heave_cmd = float(
+                        np.clip(-sitl_mixer_cmd["throttle"] * sitl_servo_scale, -1.0, 1.0)
+                    )
+                    roll_cmd = float(
+                        np.clip(
+                            sitl_mixer_cmd["roll"] * sitl_servo_scale * sitl_roll_scale,
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                    pitch_cmd = float(
+                        np.clip(
+                            sitl_mixer_cmd["pitch"] * sitl_servo_scale * sitl_pitch_scale,
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                    horiz_cmd = mix_horizontal_thrusters(fwd_cmd, sway_cmd, yaw_cmd)
+                    for name in all_thruster_names:
+                        thr_target[name] = 0.0
+                    for i, name in enumerate(horiz_order):
+                        thr_target[name] = float(horiz_cmd[i])
+                    for name in ver_names:
+                        thr_target[name] = heave_cmd
+                    vert_att_cmd = mix_vertical_attitude_cmd(roll_cmd, pitch_cmd)
+                    for i, name in enumerate(ver_names):
+                        thr_target[name] = float(np.clip(thr_target[name] + vert_att_cmd[i], -1.0, 1.0))
+                    yaw_cmd_for_stab["value"] = abs(yaw_cmd)
+                else:
+                    for name in all_thruster_names:
+                        thr_target[name] = float(
+                            np.clip(sitl_servo_cmd_norm.get(name, 0.0) * sitl_servo_scale, -1.0, 1.0)
+                        )
+                    yaw_cmd_for_stab["value"] = 0.0
+            if stale:
+                yaw_cmd_for_stab["value"] = 0.0
+            update_thruster_forces(model.opt.timestep)
+            update_propeller_visuals(model.opt.timestep if not is_paused else 0.0)
+            apply_underwater_wrench(model.opt.timestep if not is_paused else 0.0)
+            if not is_paused:
+                mujoco.mj_step(model, data)
+            if ros_bridge is not None:
+                try:
+                    ros_bridge.publish(data)
+                except Exception as exc:
+                    print(f"[ros2] publish failed, disabling bridge: {exc}", flush=True)
+                    ros_bridge.shutdown()
+                    ros_bridge = None
+            return 0.0, 0.0, 0.0, 0.0
 
         if not viewer_control_mode["value"]:
             # Manual commands
