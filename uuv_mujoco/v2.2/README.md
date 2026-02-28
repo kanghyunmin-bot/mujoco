@@ -1,340 +1,106 @@
-# UUV MuJoCo Simulator v2.2
+# UUV MuJoCo Simulator v2.2 (SITL/QGC 전용)
 
-MuJoCo 기반 UUV 시뮬레이터 배포 폴더입니다.
+MuJoCo(`run_urdf_full.py`)는 ArduSub SITL과 MAVLink로 연동되고, QGroundControl에서 제어하는 경로만 유지합니다.
 
-- 모델 씬: `urdf_full_scene.xml`
-- 메인 런너: `run_urdf_full.py`
-- ROS2 브리지: `ros2_bridge.py`
-- 버전: `VERSION.txt`
+- 유지 경로: `SITL <-> MuJoCo <-> QGC`
+- 제거 경로: 로컬 키보드/조이스틱 수동 제어, `--validate*`, `--calibrate*`
 
-## v2.2 업데이트 요약
-
-- Ubuntu 의존성 설치 스크립트 강화: `install_deps_ubuntu.sh`
-- 문서 구조 확장:
-  - `docs/PROJECT_TREE.md` (트리 + 파일별 상세)
-  - `docs/CODE_GUIDE.md` (코드 원리/함수별 설명)
-- 핵심 코드 주석/도큐스트링 정리:
-  - `run_urdf_full.py`
-  - `ros2_bridge.py`
-- Docker 작업 경로/엔트리포인트를 v2.2 기준으로 정리
-
-## 1) 빠른 시작
+## 1) 가장 빠른 전체 실행
 
 ```bash
-cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
-./install_deps_ubuntu.sh
-python3 run_urdf_full.py --scene urdf_full_scene.xml
+cd ~/antigravity
+./scripts/stack_reset.sh --with-qgc-stop
+./scripts/start_full_stack_direct.sh
 ```
 
-## 2) 의존성 설치 스크립트
+로그는 `~/antigravity/log/full_stack_YYYYMMDD_HHMMSS/`에 저장됩니다.
 
-파일: `install_deps_ubuntu.sh`
+## 2) 수동 3터미널 실행(권장 기준)
 
-기본 실행:
+터미널 1: ArduSub SITL
 
 ```bash
-./install_deps_ubuntu.sh
+cd ~/antigravity/kmu_hit25_ros2_ws/ardupilot
+python3 Tools/autotest/sim_vehicle.py -L RATBeach --console --map \
+  -v ArduSub -f vectored_6dof --model JSON \
+  --out=udp:127.0.0.1:14550 \
+  --out=udp:127.0.0.1:14551 \
+  --out=udp:127.0.0.1:14660
 ```
 
-옵션:
+터미널 2: MuJoCo
 
 ```bash
-./install_deps_ubuntu.sh --no-venv
-./install_deps_ubuntu.sh --with-ros2-dev
-./install_deps_ubuntu.sh --python python3.10
+cd ~/antigravity/mujoco/uuv_mujoco/v2.2
+./launch_competition_sim.sh --sitl --images --force-clean \
+  --sitl-servo-source mavlink \
+  --sitl-mavlink-endpoint udpin:0.0.0.0:14660
 ```
 
-설치 항목:
-
-- apt: OpenGL/X11/MuJoCo 런타임 라이브러리
-- pip: `requirements.txt` (`numpy`, `mujoco`)
-- 옵션: ROS2 개발 유틸(colcon/rosdep)
-
-## 3) 실행 방법
-
-기본 실행:
+터미널 3: QGroundControl
 
 ```bash
-python3 run_urdf_full.py --scene urdf_full_scene.xml
+QGroundControl
 ```
 
-프로파일 실행:
+## 3) 통신 파이프라인
 
-```bash
-python3 run_urdf_full.py --scene urdf_full_scene.xml --profile sim_real
-python3 run_urdf_full.py --scene urdf_full_scene.xml --profile sim_fast
-python3 run_urdf_full.py --list-profiles
-```
+- `14550/udp`: ArduSub -> QGC 텔레메트리
+- `14551/udp`: ArduSub -> MAVROS(선택)
+- `14660/udp`: ArduSub `SERVO_OUTPUT_RAW` -> MuJoCo(MAVLink 입력)
+- `9002/9003/udp`: MuJoCo <-> ArduSub JSON 센서/서보 채널
 
-대체 씬 실행:
+SITL 모드에서는 내부 `imu_stabilize/depth_hold`가 자동 비활성화됩니다. 자세/심도 제어 권한은 ArduSub/QGC에 있습니다.
 
-```bash
-python3 run_urdf_full.py --scene ocean_scene.xml
-```
+## 4) 기본 쓰러스터 매핑
 
-### 조작 키
+`run_urdf_full.py` 기본값:
 
-- `w/s`: 전후
-- `a/d`: 좌우(sway)
-- `q/e`: yaw
-- `r/f`: 상승/하강
-- `x`: 정지
-- `space`: pause
-- `m`: viewer/terminal 모드 토글
-- `c`: follow camera
-- `1/2`: stereo left/right 카메라
-- `0`: free 카메라
-- `i`: 센서 오버레이 on/off
-- `l`: 쓰러스터 라벨 on/off
+- `--sitl-servo-map yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr`
+- `--sitl-servo-signs 1,1,1,1,-1,-1,-1,-1`
 
-### 조이스틱/ROS2 입력
+채널 해석은 `SERVO1..8` 순서로 적용됩니다.
 
-- 기본 실행은 `터미널 + 로컬 조이스틱(/dev/input/js*)` 입력을 지원합니다.
-- ROS2 토픽(`/cmd_vel`, `/mavros/rc/override`)은 `--ros2` 옵션에서만 활성화됩니다.
-- 로컬 조이스틱만 끄고 싶다면 `--disable-joystick`을 사용하세요.
-- QGC의 STABILIZE/ALT\_HOLD 같은 모드는 ArduSub 모드에서 처리되며, 시뮬레이터는 `/mavros/rc/override` 또는 `/cmd_vel` 입력을 그대로 받습니다.
+## 5) 자주 쓰는 실행 옵션
 
-## 4) 검증/캘리브레이션
-
-검증:
-
-```bash
-python3 run_urdf_full.py --validate --scene urdf_full_scene.xml --validation-dir validation
-python3 run_urdf_full.py --validate-thrusters --scene urdf_full_scene.xml --validation-dir validation
-python3 run_urdf_full.py --validate --validate-thrusters --strict-validation --scene urdf_full_scene.xml --validation-dir validation
-```
-
-캘리브레이션:
-
-```bash
-python3 run_urdf_full.py --calibrate-joystick
-python3 run_urdf_full.py --calibrate-thrusters --scene urdf_full_scene.xml --calibration-dir validation
-python3 run_urdf_full.py --calibrate-thresholds --scene urdf_full_scene.xml --calibration-dir validation
-```
-
-출력 주요 파일:
-
-- `validation/summary.json`
-- `validation/validation_report.json`
-- `validation/thruster_summary.json`
-- `validation/*_step.csv`
-
-## 5) ROS2 브리지
-
-실행:
-
-```bash
-source /opt/ros/humble/setup.bash
-python3 run_urdf_full.py --scene urdf_full_scene.xml --ros2
-```
-
-스테레오 이미지 포함:
-
-```bash
-source /opt/ros/humble/setup.bash
-python3 run_urdf_full.py --scene urdf_full_scene.xml --ros2 --ros2-images --ros2-image-width 640 --ros2-image-height 360 --ros2-image-hz 10
-```
-
-카메라 calibration YAML 적용:
-
-```bash
-source /opt/ros/humble/setup.bash
-python3 run_urdf_full.py \
-  --scene urdf_full_scene.xml \
-  --ros2 --ros2-images \
-  --ros2-camera-calib-left calibration/left.yaml \
-  --ros2-camera-calib-right calibration/right.yaml
-```
-
-영상 연동(선택):
-영상 스트리밍 브리지는 운영 환경에서만 사용되며, 기본 제어/연결 경로의 필수 구성요소가 아닙니다.
-제어/기체 연동은 ArduPilot SITL JSON + MAVLink/MAVROS 경로를 사용합니다.
-
-스테레오 calibration GUI 실행:
-
-```bash
-./scripts/run_stereo_calibration.sh --size 8x6 --square 0.025 --out-dir calibration
-```
-
-기본 SITL 실행:
-
-```bash
-./launch_competition_sim.sh --sitl --images --force-clean
-```
-
-ArduSub(JSON)+QGroundControl 권장 실행 순서:
-
-터미널 1 (ArduSub SITL):
-
-```bash
-cd /home/khm/antigravity
-./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --frame vectored_6dof --force-clean
-```
-
-기본 SITL 실행 스크립트는 안정화 목적으로 다음 파라미터를 자동 적용합니다:
-`ARMING_CHECK=0`, `EK3_IMU_MASK=1`, `INS_USE2/3=0`, `COMPASS_USE2/3=0`, `FS_GCS_ENABLE=0`
-
-터미널 2 (MuJoCo bridge + competition map):
-
-```bash
-cd /home/khm/antigravity/mujoco/uuv_mujoco/v2.2
-./launch_competition_sim.sh --sitl --images --force-clean
-```
-
-### QGC 입력 방향/세기 조정(중요)
-
-기본 SITL 경로는 `--sitl-servo-map auto` 역믹서 모드입니다.  
-ArduSub PWM(servo 1..N)을 프레임 믹서 기준으로 `forward/lateral/yaw/heave/roll/pitch`로 복원한 뒤,
-MuJoCo 쓰러스터로 재할당합니다.
+직접 매핑(기본):
 
 ```bash
 ./launch_competition_sim.sh --sitl --images --force-clean \
-  --sitl-servo-map auto \
-  --sitl-mixer-frame auto \
-  --sitl-servo-scale 1.0 \
-  --sitl-roll-scale 0.45 \
-  --sitl-pitch-scale 0.45 \
-  --sitl-command-debug
+  --sitl-servo-source mavlink \
+  --sitl-direct-thrusters
 ```
 
-정리:
-- `--sitl-servo-map auto` : ArduSub mixer 역추정 자동 모드.
-- `--sitl-mixer-frame` : `auto|vectored|vectored_6dof` 프레임 선택.
-- `--sitl-servo-scale` : 조작 감도(전체 스케일).
-- `--sitl-roll-scale`, `--sitl-pitch-scale` : STABILIZE 롤/피치 보정 감도(기본 0.45).
-- `--sitl-command-debug` : `SITL servo pwm[1..8]` + 역믹싱 결과 로그 출력.
-
-프레임별 권장:
-- `vectored`: 6모터 ArduSub 출력 기반
-- `vectored_6dof`: 8모터 ArduSub 출력 기반
-
-레거시 축 재매핑이 필요하면 `--no-sitl-direct-thrusters`를 추가하고 기존 `--sitl-rc-ch-*`, `--sitl-*-sign`, `--sitl-cmd-scale`를 사용하세요.
-
-터미널 3은 선택 사항입니다. (ROS2 토픽 제어를 쓰는 경우에만 필요)
-
-`/cmd_vel` 기반 부드러운 이동 데모:
+역믹서 모드(필요 시만):
 
 ```bash
-source /opt/ros/humble/setup.bash
-python3 scripts/hover_motion_demo.py --loop
+./launch_competition_sim.sh --sitl --images --force-clean \
+  --sitl-servo-source mavlink \
+  --no-sitl-direct-thrusters \
+  --sitl-mixer-frame vectored_6dof
 ```
 
-토픽:
+## 6) 트러블슈팅
 
-- Publish: `/imu/data`, `/dvl/velocity`, `/dvl/altitude`
-- Publish(옵션): `/stereo/left|right/image_raw`, `/stereo/left|right/camera_info`
-- Subscribe: `/cmd_vel`
-
-## 6) 프로젝트 구조(요약)
-
-```text
-v2.2/
-├── run_urdf_full.py
-├── ros2_bridge.py
-├── urdf_full_scene.xml
-├── ocean_scene.xml
-├── joystick_map.json
-├── imu_calibration.json (legacy, 현재 미사용)
-├── sim_profiles.json
-├── thruster_tune.json
-├── thruster_params.json
-├── validation_thresholds.json
-├── install_deps_ubuntu.sh
-├── scripts/print_tree.sh
-├── Dockerfile
-├── docker/entrypoint.sh
-├── assets/urdf_full/meshes_split/*
-├── validation/README.md
-└── docs/
-    ├── PROJECT_TREE.md
-    └── CODE_GUIDE.md
-```
-
-자세한 트리/파일별 설명:
-
-- `docs/PROJECT_TREE.md`
-- `./scripts/print_tree.sh`로 현재 폴더 트리를 즉시 확인 가능
-
-코드 원리/함수별 정리:
-
-- `docs/CODE_GUIDE.md`
-
-## 7) 코드 원리 요약 (README 간단판)
-
-- 입력 계층: terminal/joystick/ROS2 입력을 공통 `cmd` 상태로 통합
-- 추진기 혼합: 수평 4개 추진기는 의사역행렬로 `forward+sway+yaw` 동시 만족
-- 수중 물리: 단순화 모델(부력 + 감쇠 + 선택적 자세 안정화)로 안정성 우선
-- 검증 체계: step response + 단일 추진기 검증을 JSON/CSV로 자동 기록
-- 캘리브레이션: 조이스틱/추진기 게인/검증 임계값을 코드 수정 없이 JSON 갱신
-
-## 8) Docker
-
-빌드:
+QGC 연결 안 됨:
 
 ```bash
-docker build -t uuv-mujoco:v2.2 .
+ss -lupn | rg '14550|14551|14660|9002|9003'
+pkill -f "sim_vehicle.py|run_urdf_full.py|QGroundControl"
 ```
 
-헤드리스 검증:
+SITL이 바로 종료됨:
 
-```bash
-docker run --rm -it --network host uuv-mujoco:v2.2 \
-  python3 run_urdf_full.py --validate --scene urdf_full_scene.xml --validation-dir validation
-```
+- `~/antigravity/log/full_stack_*/ardusub.log` 확인
+- `--model JSON`, `--out ... 14660` 포함 여부 확인
 
-GUI 실행(X11):
+제어가 중립만 들어옴:
 
-```bash
-xhost +local:root
-docker run --rm -it --network host \
-  -e DISPLAY=$DISPLAY \
-  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  uuv-mujoco:v2.2 \
-  python3 run_urdf_full.py --scene urdf_full_scene.xml
-```
+- `mujoco.log`에 `servo stream is neutral` 반복 여부 확인
+- SITL과 MuJoCo의 `--sitl-mavlink-endpoint` 포트 일치 확인
 
-## 9) 트러블슈팅
+## 7) 문서
 
-- `No module named rclpy`
-  - ROS2 미설치 또는 `source /opt/ros/humble/setup.bash` 미적용
-- QGroundControl 미연결
-  - 자동연결이 안되면 `Application Settings > Comm Links`에서 수동 추가
-  - 권장: `UDP`, `Port=14550`
-  - 대체: `TCP`, `Server=127.0.0.1`, `Port=5760`
-  - ArduSub 실행 스크립트와 포트 일치 확인:
-    - QGC 기본 `14550`은 `run_ardusub_json_sitl.sh` 기본 `--qgc-port`와 매칭되어야 함.
-    - TCP를 쓰려면 스크립트 실행 시 `--qgc-link tcpclient --qgc-port 5760` 사용 가능
-- `No JSON sensor message received, resending servos`
-  - 시작 직후 몇 줄은 정상(시뮬레이터 연결 대기)
-  - 5~10초 이상 계속 반복되면 비정상
-  - MuJoCo를 반드시 `--sitl`로 실행해야 함:
-    - `./launch_competition_sim.sh --sitl --images`
-  - `--images`는 카메라 토픽 사용이 필요하므로 `--ros2`를 함께 요청합니다.
-  - `--sitl`만 사용하면 기본 동작은 MAVLink JSON UDP만 사용합니다.
-  - ArduSub는 `--model JSON`으로 실행되어야 함:
-  - `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh`
-  - QGC 링크 타입을 강제하려면:
-    - UDP: `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --qgc-link udpclient --qgc-port 14550`
-    - TCP: `./kmu_hit25_ros2_ws/scripts/run_ardusub_json_sitl.sh --qgc-link tcpclient --qgc-port 5760`
-  - JSON 포트 충돌 확인:
-    - `ss -lupn | rg '9002|5760|14550'`
-- ArduPilot이 QGC를 못 받는지 확인:
-  - 시뮬 시작 후 1초 내에 아래 로그가 보이면 정상:
-    - ArduSub: `[SIM]` 또는 `Connecting to` 계열 시작 로그
-    - MuJoCo 브릿지: `[ros2_bridge] SITL socket initialized`
-    - MuJoCo 브릿지: `[ros2_bridge] SITL servo endpoint discovered`
-  - 안 보이면 포트 점유/방화벽/다른 QGC 인스턴스를 점검:
-    - `ss -lupn | rg '14550|5760|9002|9003'`
-    - `pkill -f "QGroundControl|run_ardusub_json_sitl|sim_vehicle.py"`
-- ROS2 publish callback이 바로 비활성화되는 경우
-  - `ROS2 callbacks disabled (SITL still active)` 로그는 ROS2 토픽이 잠깐 깨졌을 때만 표시될 수 있음
-  - SITL 모드에서는 9002 소켓 송신은 계속 유지되며, 하향 제어는 ArduSub JSON 경로를 통해 동작함
-- `DDS: No ping response, exiting`
-  - DDS 미사용이면 무시 가능
-  - 기본 실행 스크립트는 `DDS_ENABLE=0`으로 실행
-- GUI 미표시
-  - OpenGL/X11 패키지 설치 여부 및 `DISPLAY` 확인
-- 조이스틱 축 반전
-  - `joystick_map.json`의 `axis_sign` 값 조정
-- 메쉬 파일 에러
-  - `assets/urdf_full/meshes_split` 경로 확인
+- 코드 구조: `docs/CODE_GUIDE.md`
+- 파일 구조: `docs/PROJECT_TREE.md`
+- 쓰러스터 구현 상세: `docs/ROV_THRUSTER_IMPL_GUIDE_KR.md`

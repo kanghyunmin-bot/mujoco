@@ -1,115 +1,91 @@
-# UUV MuJoCo v2.2 Code Guide
+# UUV MuJoCo v2.2 Code Guide (SITL/QGC 전용)
 
-이 문서는 `v2.2`의 주요 파일별 코드 원리와 실행 흐름을 정리합니다.
+이 문서는 `run_urdf_full.py`의 현재 운영 경로를 SITL/QGC 기준으로 정리합니다.
 
 ## 1) `run_urdf_full.py`
 
 ### 1.1 역할
 
-- 단일 엔트리포인트에서 아래 모드를 모두 처리합니다.
-- 실시간 뷰어 실행
-- 조이스틱/키보드 제어
-- 검증(`--validate`, `--validate-thrusters`)
-- 캘리브레이션(`--calibrate-*`)
-- ROS2 브리지 활성화(`--ros2`, 선택적)
+- SITL(MAVLink + JSON) 입력을 받아 MuJoCo 쓰러스터 제어로 변환
+- IMU/DVL/카메라를 ROS2 토픽으로 발행(옵션)
+- `thr_target -> data.ctrl` 물리 반영
 
-### 1.2 핵심 흐름
+### 1.2 핵심 실행 흐름
 
-1. CLI 파싱
-2. 프로파일/임계값 JSON 로드
-3. MuJoCo 모델 초기화
-4. 제어 입력 루프(terminal + joystick)
-5. 물리 루프(쓰러스터 + 부력 + 감쇠)
-6. 오버레이 렌더링(벡터/센서 라벨)
-7. 필요 시 검증/캘리브레이션 리포트 저장
+1. CLI 파싱 (`--sitl`, `--sitl-servo-*`, `--ros2*`)
+2. MuJoCo 모델/액추에이터 로드
+3. SITL 서보 수신(MAVLink `SERVO_OUTPUT_RAW` 또는 JSON)
+4. 쓰러스터 명령 생성(direct mapping 또는 mixer inverse)
+5. `update_thruster_forces()`로 `data.ctrl` 적용
+6. `apply_underwater_wrench()`로 부력/감쇠 적용
+7. `ros_bridge.publish()`로 센서/영상 발행
 
-### 1.3 함수 그룹
+### 1.3 핵심 함수
 
-| Function | Principle | Why it matters |
+| Function | Principle | 목적 |
 |---|---|---|
-| `apply_joystick_axes` | raw axis -> deadzone -> normalized command | 컨트롤러 교체 시 최소 수정 포인트 |
-| `mix_horizontal_thrusters` | 의사역행렬 기반 4개 수평 쓰러스터 믹싱 | 전진/스웨이/요를 동시 만족 |
-| `update_stabilization` | IMU 기반 roll/pitch PID(PI+D 형태) | 자세 유지(전복 완화) |
-| `apply_underwater_wrench` | 단순 수중 모델(부력 + 선형/각속 감쇠) | 과도한 과장 없이 안정성 확보 |
-| `run_validation` | step response 지표화 | 튜닝 회귀(regression) 탐지 |
-| `run_thruster_validation` | 단일 쓰러스터 방향 검증 | 축/기어 벡터 오류 탐지 |
-| `calibrate_thruster_gains` | 속도 편차 기반 gain_scale 보정 | 하드웨어 비대칭 근사 |
+| `mix_horizontal_thrusters` | 의사역행렬 기반 수평 4추진기 분배 | 전진/스웨이/요 동시 만족 |
+| `build_horizontal_allocator` | site 위치 + gear 기반 alloc 행렬 구성 | 지오메트리 일관성 보장 |
+| `build_vertical_allocator` | 수직 쓰러스터로 roll/pitch 보정 분배 | 자세 보정 토크 분산 |
+| `update_thruster_forces` | `thr_target`을 실제 힘으로 변환 후 clamp | actuator 안정 적용 |
+| `apply_underwater_wrench` | 부력 + 선형/각속 감쇠 | 과도 진동 완화 |
 
-### 1.4 설계 원칙
+### 1.4 현재 제거된 기능
 
-- 수중 유체 모델은 복잡 모델보다 안정적/재현 가능한 단순 모델을 우선합니다.
-- 모든 튜닝 값은 JSON 파일로 분리해 코드 수정 없이 반복 조정 가능합니다.
-- 검증 결과는 CSV/JSON 동시 저장하여 시각화/자동판정 둘 다 대응합니다.
+- 로컬 키보드/조이스틱 수동 입력
+- 검증 모드(`--validate*`)
+- 캘리브레이션 모드(`--calibrate*`)
 
 ## 2) `ros2_bridge.py`
 
 ### 2.1 역할
 
-- `/cmd_vel` 구독 후 시뮬레이터 명령으로 변환
-- IMU/DVL 센서를 ROS2 메시지로 발행
-- 기본으로 `--sitl`은 JSON UDP만 사용하며, `--ros2` 지정 시 `sitl` + `stereo image + camera_info`를 ROS2로 발행합니다.
+- `/cmd_vel` 및 `/mavros/rc/override` 입력 처리(옵션)
+- `/imu/data`, `/dvl/*`, `/depth`, `/mujoco/ground_truth/pose` 발행
+- `--ros2-images` 사용 시 `/stereo/*` 발행
 
-### 2.2 핵심 함수
+### 2.2 주의사항
 
-| Function | Principle | Note |
-|---|---|---|
-| `_on_cmd_vel` | `[-1,1]` clamp 후 내부 thrust scale로 매핑 | 과입력 방지 |
-| `spin_once` | non-blocking ROS callback 처리 + timeout stop | 안전 정지 fail-safe |
-| `publish` | sensor/image 주기 분리 발행 | 고주파 센서 + 저주파 이미지 병행 |
-| `_build_camera_info` | MuJoCo fovy -> pinhole 파라미터 추정 | ROS2 camera pipeline 연동 |
-
-### 2.3 프레임 주의점
-
-- MuJoCo quaternion은 `[w, x, y, z]` 순서입니다.
-- ROS2 메시지 프레임 이름은 `imu_link`, `dvl_link`, `*_optical`을 사용합니다.
+- SITL 모드에서 RC override 충돌 방지를 위해 기본적으로 `/mavros/rc/override`를 제한할 수 있음
+- 센서 발행률은 `--ros2-sensor-hz`, 영상은 `--ros2-image-hz`로 분리
 
 ## 3) `urdf_full_scene.xml`
 
 ### 3.1 역할
 
-- 로봇 메쉬/관절/사이트/센서/카메라 배치
-- 쓰러스터 site 위치와 actuator gear 방향 정의
-- 기본 수영장 환경(바닥/벽/수면 시각화)
+- 쓰러스터 site 위치
+- actuator gear 방향 벡터
+- IMU/DVL/카메라 기준 site
 
 ### 3.2 튜닝 포인트
 
-| Element | What to tune |
+| Element | 조정 항목 |
 |---|---|
-| `<body name="base_link" ...>` | 초기 자세(스폰 orientation) |
-| `<site name="imu_site" ...>` | IMU 설치 위치/방향 |
-| `<site name="dvl_site" ...>` | DVL 설치 위치/방향 |
-| `<motor name="yaw_*" gear="...">` | 수평 추진 방향 벡터 |
-| `<motor name="ver_*" gear="...">` | 수직 추진 방향 벡터 |
+| `<motor name="yaw_*" gear="...">` | 수평 추진 방향/요 토크 응답 |
+| `<motor name="ver_*" gear="...">` | 수직 추진/상하 응답 |
+| `<site name="thr_*">` | 추력 작용점(레버암) |
+| `<site name="imu_site">`, `<site name="dvl_site">` | 센서 기준 프레임 |
 
-## 4) JSON Config Files
-
-### `joystick_map.json`
-
-- `axes`: 채널별 입력 축 ID
-- `axis_sign`: 축 반전 부호
-- `deadzone`, `yaw_deadzone`: 저속 떨림 억제
-- `buttons`: stop/pause/mode 버튼 매핑
+## 4) JSON 설정 파일
 
 ### `sim_profiles.json`
 
-- 프로파일별 부력/드래그/쓰러스터 최대힘/검증 적분기 설정
-- `sim_real`: 현실성 우선
-- `sim_fast`: 빠른 반복 튜닝 우선
+- `sim_real`, `sim_fast` 물리 파라미터 묶음
+- 부력, 감쇠, 타임스텝, 쓰러스터 최대힘 포함
 
-### `validation_thresholds.json`
+### `thruster_tune.json`
 
-- step response 및 단일 쓰러스터 통과 기준
-- `--strict-validation` 시 CI 스타일 fail gate로 사용 가능
+- actuator gear 보정 벡터
+- allocator 계산의 기준 방향
 
-### `imu_calibration.json`
+### `thruster_params.json`
 
-- 현재 v2.1 런타임 경로에서는 읽지 않는 레거시 파일입니다.
-- 이전 실험 결과 보관 용도로만 유지합니다.
+- per-thruster `gain_scale`
+- 비대칭 응답 보정
 
 ## 5) 운영 체크리스트
 
-1. `install_deps_ubuntu.sh` 실행
-2. `python3 run_urdf_full.py --scene urdf_full_scene.xml`
-3. 조이스틱 축 확인(좌우 반전 시 `joystick_map.json`의 `axis_sign.sway` 조정)
-4. 검증 실행 후 `validation/validation_report.json` 확인
-5. 필요 시 `--calibrate-thrusters`, `--calibrate-thresholds` 순으로 보정
+1. ArduSub를 `--model JSON` + `--out ...:14660`으로 실행
+2. MuJoCo를 `--sitl --sitl-servo-source mavlink`로 실행
+3. QGC에서 arm/mode 전환 후 입력 시 `mujoco.log`의 servo 수신 로그 확인
+4. 출력 방향 이상 시 `--sitl-servo-map`, `--sitl-servo-signs` 우선 조정

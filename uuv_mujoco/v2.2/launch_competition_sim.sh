@@ -19,10 +19,12 @@ SITL_PORT="9002"
 SITL_SEND_PORT="9003"
 EXTRA_ARGS=()
 PROFILE=""
-THRUSTER_VOLTAGE=""
 HOVER_STABLE_REQUESTED=false
-ALLOW_LOCAL_JOYSTICK=false
 FORCE_CLEAN=false
+SITL_MAVLINK_TARGET_SYSID=0
+SITL_MAVLINK_TARGET_COMPID=0
+SITL_MAVLINK_SOURCE_SYSID=255
+SITL_MAVLINK_SOURCE_COMPID=190
 while [[ $# -gt 0 ]]; do
     case $1 in
         --headless)
@@ -32,7 +34,6 @@ while [[ $# -gt 0 ]]; do
         --images)
             IMAGES="--ros2-images"
             ROS2_REQUESTED=true
-            EXTRA_ARGS+=(--ros2)
             shift
             ;;
         --sitl)
@@ -72,10 +73,6 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             ;;
-        --allow-local-joystick)
-            ALLOW_LOCAL_JOYSTICK=true
-            shift
-            ;;
         --force-clean)
             FORCE_CLEAN=true
             shift
@@ -94,7 +91,6 @@ while [[ $# -gt 0 ]]; do
                 echo "Missing value for --thruster-voltage"
                 exit 2
             fi
-            THRUSTER_VOLTAGE="$2"
             EXTRA_ARGS+=("--thruster-voltage" "$2")
             shift 2
             ;;
@@ -125,7 +121,27 @@ extra_arg_present() {
     local needle="$1"
     local token
     for token in "${EXTRA_ARGS[@]}"; do
+        if [[ "$token" == "$needle" || "$token" == "$needle="* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_arg_value() {
+    local needle="$1"
+    local token idx next_idx
+    for idx in "${!EXTRA_ARGS[@]}"; do
+        token="${EXTRA_ARGS[$idx]}"
+        if [[ "$token" == "$needle="* ]]; then
+            printf "%s" "${token#*=}"
+            return 0
+        fi
         if [[ "$token" == "$needle" ]]; then
+            next_idx=$((idx + 1))
+            if (( next_idx < ${#EXTRA_ARGS[@]} )); then
+                printf "%s" "${EXTRA_ARGS[$next_idx]}"
+            fi
             return 0
         fi
     done
@@ -213,32 +229,51 @@ if [[ -n "$SITL_ARG" ]]; then
         PROFILE="sim_real"
         EXTRA_ARGS+=(--profile "$PROFILE")
     fi
-    if [[ "$ALLOW_LOCAL_JOYSTICK" == false && "$ROS2_REQUESTED" == false ]]; then
-        # Prevent accidental local joystick noise from overriding SITL inputs.
-        EXTRA_ARGS+=(--disable-joystick)
-        echo "[launch] SITL mode: local /dev/input joystick disabled (use --allow-local-joystick to override)."
-    fi
-    # Stabilize/Manual in ArduSub are significantly more robust when MuJoCo
-    # consumes direct per-motor PWM (instead of mixer-inverse reconstruction).
-    # Apply a safe default map unless user explicitly overrides SITL motor routing.
-    if ! extra_arg_present "--sitl-servo-map" \
-        && ! extra_arg_present "--sitl-servo-signs" \
-        && ! extra_arg_present "--no-sitl-direct-thrusters" \
-        && ! extra_arg_present "--sitl-mixer-frame"; then
-        EXTRA_ARGS+=(
-            --sitl-servo-map "yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr"
-            --sitl-servo-signs "1,1,1,1,1,1,1,1"
-        )
-        echo "[launch] SITL mode: defaulting to direct thruster map (ch1..8 -> yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr)."
-    fi
     # Raise SITL sensor feed rate by default to reduce EKF lag in stabilize mode.
     if ! extra_arg_present "--ros2-sensor-hz"; then
         EXTRA_ARGS+=(--ros2-sensor-hz 200)
         echo "[launch] SITL mode: overriding sensor publish rate to 200 Hz (use --ros2-sensor-hz to set manually)."
     fi
+    # Use MAVLink as the default servo source for the standard QGC control path.
+    if ! extra_arg_present "--sitl-servo-source"; then
+        EXTRA_ARGS+=(--sitl-servo-source mavlink)
+        echo "[launch] SITL mode: defaulting servo source to mavlink."
+    else
+        if [[ "$(get_arg_value --sitl-servo-source)" == "json" ]]; then
+            echo "[launch] SITL mode: using servo source json."
+        elif [[ "$(get_arg_value --sitl-servo-source)" == "mavlink" ]]; then
+            echo "[launch] SITL mode: using servo source mavlink (SERVO_OUTPUT_RAW)."
+        else
+            echo "[launch] SITL mode: custom servo source '$(get_arg_value --sitl-servo-source)'."
+        fi
+    fi
+    if ! extra_arg_present "--sitl-mavlink-target-sysid"; then
+        EXTRA_ARGS+=(--sitl-mavlink-target-sysid "${SITL_MAVLINK_TARGET_SYSID}")
+    fi
+    if ! extra_arg_present "--sitl-mavlink-target-compid"; then
+        EXTRA_ARGS+=(--sitl-mavlink-target-compid "${SITL_MAVLINK_TARGET_COMPID}")
+    fi
+    if ! extra_arg_present "--sitl-mavlink-source-sysid"; then
+        EXTRA_ARGS+=(--sitl-mavlink-source-sysid "${SITL_MAVLINK_SOURCE_SYSID}")
+    fi
+    if ! extra_arg_present "--sitl-mavlink-source-compid"; then
+        EXTRA_ARGS+=(--sitl-mavlink-source-compid "${SITL_MAVLINK_SOURCE_COMPID}")
+    fi
+    if ! extra_arg_present "--sitl-mavlink-endpoint"; then
+        EXTRA_ARGS+=(--sitl-mavlink-endpoint "udpin:0.0.0.0:14660")
+    fi
+    if ! extra_arg_present "--sitl-mavlink-servo-hz"; then
+        EXTRA_ARGS+=(--sitl-mavlink-servo-hz 80)
+    fi
+    # Lower input latency defaults for SITL command loops.
+    : "${ROS2_UUV_CMD_DEADBAND:=0.015}"
+    : "${ROS2_UUV_CMD_SLEW_RATE:=30.0}"
+    : "${ROS2_UUV_CMD_TIMEOUT_S:=0.45}"
+    export ROS2_UUV_CMD_DEADBAND ROS2_UUV_CMD_SLEW_RATE ROS2_UUV_CMD_TIMEOUT_S
+    echo "[launch] SITL mode: cmd filter deadband=${ROS2_UUV_CMD_DEADBAND}, slew=${ROS2_UUV_CMD_SLEW_RATE}/s, timeout=${ROS2_UUV_CMD_TIMEOUT_S}s"
 fi
 
-if [ "$ROS2_REQUESTED" = true ]; then
+if [ "$ROS2_REQUESTED" = true ] && ! extra_arg_present "--ros2"; then
     EXTRA_ARGS+=(--ros2)
 fi
 
@@ -265,8 +300,6 @@ fi
 python3 run_urdf_full.py \
     --scene competition_scene.xml \
     $IMAGES $SITL_ARG $HEADLESS_ARG \
-    --ros2-sensor-hz 50 \
-    --ros2-image-hz 15 \
     ${SITL_ARG:+--sitl-port "$SITL_PORT"} \
     ${SITL_ARG:+--sitl-send-port "$SITL_SEND_PORT"} \
     "${EXTRA_ARGS[@]}"
