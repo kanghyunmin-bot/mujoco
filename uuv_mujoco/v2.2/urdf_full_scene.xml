@@ -1,5 +1,5 @@
 <mujoco model="urdf_full">
-  <!-- v2.1 baseline scene: pool environment + full ROV mesh + 8 thrusters -->
+  <!-- v2.2 baseline scene: pool environment + full ROV mesh + 8 thrusters -->
   <compiler angle="radian" meshdir="assets/urdf_full/meshes_split/" />
 
   <!-- Keep global medium as air; underwater behavior is modeled in runtime code. -->
@@ -81,8 +81,8 @@
       <site name="buoy_p7" pos="0.2500 0.0900 -0.1826" size="0.01" rgba="0.2 0.8 1 0.5" />
       <site name="buoy_p8" pos="0.1100 0.0900 -0.1826" size="0.01" rgba="0.2 0.8 1 0.5" />
       <!-- Sensor mounting sites -->
-      <site name="imu_site" pos="0.1807 0.1472 -0.1826" quat="0.7071068 0.7071068 0 0" size="0.020" rgba="1 1 0 1" />
-      <site name="dvl_site" pos="0.1807 0.2500 -0.1826" quat="0.7071068 -0.7071068 0 0" size="0.020" rgba="0 1 1 1" />
+      <site name="imu_site" pos="0.1807 0.1472 -0.1826" quat="1 0 0 0" size="0.020" rgba="1 1 0 1" />
+      <site name="dvl_site" pos="0.1807 0.2500 -0.1826" quat="1 0 0 0" size="0.020" rgba="0 1 1 1" />
 
 
       
@@ -138,9 +138,9 @@
 
     
     <motor name="yaw_lf" site="thr_yaw_lf" gear="0.735142 0 -0.677913 0 0 0" ctrlrange="-80 80" />
-    <motor name="yaw_lr" site="thr_yaw_lr" gear="0.707105 0 0.707108 0 0 0" ctrlrange="-80 80" />
+    <motor name="yaw_lr" site="thr_yaw_lr" gear="-0.707105 0 -0.707108 0 0 0" ctrlrange="-80 80" />
     <motor name="yaw_rf" site="thr_yaw_rf" gear="0.707105 0 0.707108 0 0 0" ctrlrange="-80 80" />
-    <motor name="yaw_rr" site="thr_yaw_rr" gear="0.705343 0 -0.708867 0 0 0" ctrlrange="-80 80" />
+    <motor name="yaw_rr" site="thr_yaw_rr" gear="-0.705343 0 0.708867 0 0 0" ctrlrange="-80 80" />
 
     
   </actuator>

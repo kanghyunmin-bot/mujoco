@@ -8,6 +8,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+VIDEO_BRIDGE_SCRIPT="${SCRIPT_DIR}/scripts/ros2_to_qgc_video.py"
+VIDEO_BRIDGE_PID=""
 
 # Parse arguments
 HEADLESS=false
@@ -21,9 +23,9 @@ EXTRA_ARGS=()
 PROFILE=""
 HOVER_STABLE_REQUESTED=false
 FORCE_CLEAN=false
-SITL_MAVLINK_TARGET_SYSID=0
-SITL_MAVLINK_TARGET_COMPID=0
-SITL_MAVLINK_SOURCE_SYSID=255
+SITL_MAVLINK_TARGET_SYSID=1
+SITL_MAVLINK_TARGET_COMPID=1
+SITL_MAVLINK_SOURCE_SYSID=200
 SITL_MAVLINK_SOURCE_COMPID=190
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -149,9 +151,7 @@ get_arg_value() {
 }
 
 collect_existing_mujoco_pids() {
-    ps -eo pid=,args= | awk '
-        index($0, "run_urdf_full.py --scene competition_scene.xml") > 0 { print $1 }
-    '
+    pgrep -f "run_urdf_full.py --scene competition_scene.xml" || true
 }
 
 kill_pid_list() {
@@ -231,8 +231,12 @@ if [[ -n "$SITL_ARG" ]]; then
     fi
     # Raise SITL sensor feed rate by default to reduce EKF lag in stabilize mode.
     if ! extra_arg_present "--ros2-sensor-hz"; then
-        EXTRA_ARGS+=(--ros2-sensor-hz 200)
-        echo "[launch] SITL mode: overriding sensor publish rate to 200 Hz (use --ros2-sensor-hz to set manually)."
+        EXTRA_ARGS+=(--ros2-sensor-hz 300)
+        echo "[launch] SITL mode: overriding sensor publish rate to 300 Hz (use --ros2-sensor-hz to set manually)."
+    fi
+    if ! extra_arg_present "--thruster-loop-hz"; then
+        EXTRA_ARGS+=(--thruster-loop-hz 60)
+        echo "[launch] SITL mode: overriding thruster loop rate to 60 Hz (use --thruster-loop-hz to set manually)."
     fi
     # Use MAVLink as the default servo source for the standard QGC control path.
     if ! extra_arg_present "--sitl-servo-source"; then
@@ -263,14 +267,27 @@ if [[ -n "$SITL_ARG" ]]; then
         EXTRA_ARGS+=(--sitl-mavlink-endpoint "udpin:0.0.0.0:14660")
     fi
     if ! extra_arg_present "--sitl-mavlink-servo-hz"; then
-        EXTRA_ARGS+=(--sitl-mavlink-servo-hz 80)
+        EXTRA_ARGS+=(--sitl-mavlink-servo-hz 20)
+    fi
+    if ! extra_arg_present "--sitl-servo-map"; then
+        # Direct-thruster mapping aligned with run_urdf_full.py defaults and
+        # launch_stack_auto.sh so every launch path uses identical directions.
+        EXTRA_ARGS+=(--sitl-servo-map "yaw_rr,yaw_lr,yaw_rf,yaw_lf,ver_lf,ver_rf,ver_lr,ver_rr")
+    fi
+    if ! extra_arg_present "--sitl-servo-signs"; then
+        # Keep all thruster signs positive to avoid launch-path-dependent axis flips.
+        EXTRA_ARGS+=(--sitl-servo-signs=1,1,1,1,1,1,1,1)
+    fi
+    if ! extra_arg_present "--sitl-servo-scale"; then
+        EXTRA_ARGS+=(--sitl-servo-scale "0.40")
     fi
     # Lower input latency defaults for SITL command loops.
-    : "${ROS2_UUV_CMD_DEADBAND:=0.015}"
-    : "${ROS2_UUV_CMD_SLEW_RATE:=30.0}"
+    : "${ROS2_UUV_CMD_DEADBAND:=0.005}"
+    : "${ROS2_UUV_CMD_SLEW_RATE:=45.0}"
     : "${ROS2_UUV_CMD_TIMEOUT_S:=0.45}"
-    export ROS2_UUV_CMD_DEADBAND ROS2_UUV_CMD_SLEW_RATE ROS2_UUV_CMD_TIMEOUT_S
-    echo "[launch] SITL mode: cmd filter deadband=${ROS2_UUV_CMD_DEADBAND}, slew=${ROS2_UUV_CMD_SLEW_RATE}/s, timeout=${ROS2_UUV_CMD_TIMEOUT_S}s"
+    : "${ROS2_UUV_SITL_MAVLINK_TIMEOUT_S:=1.5}"
+    export ROS2_UUV_CMD_DEADBAND ROS2_UUV_CMD_SLEW_RATE ROS2_UUV_CMD_TIMEOUT_S ROS2_UUV_SITL_MAVLINK_TIMEOUT_S
+    echo "[launch] SITL mode: cmd filter deadband=${ROS2_UUV_CMD_DEADBAND}, slew=${ROS2_UUV_CMD_SLEW_RATE}/s, timeout=${ROS2_UUV_CMD_TIMEOUT_S}s, mavlink_timeout=${ROS2_UUV_SITL_MAVLINK_TIMEOUT_S}s"
 fi
 
 if [ "$ROS2_REQUESTED" = true ] && ! extra_arg_present "--ros2"; then
@@ -295,6 +312,41 @@ fi
 
 if [[ -n "$PROFILE" && "$PROFILE" != "sim_real" ]]; then
     echo "[launch] Simulation profile: $PROFILE"
+fi
+
+cleanup_video_bridge() {
+    if [[ -n "$VIDEO_BRIDGE_PID" ]] && kill -0 "$VIDEO_BRIDGE_PID" 2>/dev/null; then
+        kill "$VIDEO_BRIDGE_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_video_bridge EXIT INT TERM
+
+if [[ -n "$SITL_ARG" && -n "$IMAGES" && "${AG_DISABLE_QGC_VIDEO_BRIDGE:-0}" != "1" ]]; then
+    if [[ -f "$VIDEO_BRIDGE_SCRIPT" ]]; then
+        QGC_VIDEO_TOPIC="${QGC_VIDEO_TOPIC:-/stereo/left/image_raw}"
+        QGC_VIDEO_HOST="${QGC_VIDEO_HOST:-127.0.0.1}"
+        QGC_VIDEO_PORT="${QGC_VIDEO_PORT:-5600}"
+        QGC_VIDEO_FPS="${QGC_VIDEO_FPS:-15}"
+        QGC_VIDEO_BITRATE_KBPS="${QGC_VIDEO_BITRATE_KBPS:-2600}"
+        QGC_VIDEO_WIDTH="${QGC_VIDEO_WIDTH:-640}"
+        QGC_VIDEO_HEIGHT="${QGC_VIDEO_HEIGHT:-360}"
+        QGC_VIDEO_LOG="${QGC_VIDEO_LOG:-/tmp/uuv_qgc_video_bridge.log}"
+        echo "[launch] auto video bridge: ${QGC_VIDEO_TOPIC} -> udp://${QGC_VIDEO_HOST}:${QGC_VIDEO_PORT}"
+        (
+            python3 "$VIDEO_BRIDGE_SCRIPT" \
+                --topic "$QGC_VIDEO_TOPIC" \
+                --host "$QGC_VIDEO_HOST" \
+                --port "$QGC_VIDEO_PORT" \
+                --fps "$QGC_VIDEO_FPS" \
+                --bitrate-kbps "$QGC_VIDEO_BITRATE_KBPS" \
+                --width "$QGC_VIDEO_WIDTH" \
+                --height "$QGC_VIDEO_HEIGHT"
+        ) >"$QGC_VIDEO_LOG" 2>&1 &
+        VIDEO_BRIDGE_PID=$!
+        echo "[launch] auto video bridge pid=${VIDEO_BRIDGE_PID} (log: ${QGC_VIDEO_LOG})"
+    else
+        echo "[launch] warning: auto video bridge script not found: ${VIDEO_BRIDGE_SCRIPT}"
+    fi
 fi
 
 python3 run_urdf_full.py \

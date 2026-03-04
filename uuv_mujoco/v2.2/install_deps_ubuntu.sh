@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ubuntu host bootstrap for UUV MuJoCo v2.1.
+# Ubuntu host bootstrap for UUV MuJoCo v2.2.
 # - Installs system OpenGL/X11 runtime libs for MuJoCo viewer.
 # - Installs Python dependencies from requirements.txt.
 # - Optionally creates a local virtual environment.

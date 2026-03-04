@@ -11,14 +11,14 @@ RUN apt-get update && apt-get install -y \
     libosmesa6 mesa-utils xvfb \
   && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace/uuv_mujoco_v2_1
+WORKDIR /workspace/uuv_mujoco_v2_2
 
 # Python deps first for better Docker layer cache reuse.
-COPY requirements.txt /workspace/uuv_mujoco_v2_1/requirements.txt
+COPY requirements.txt /workspace/uuv_mujoco_v2_2/requirements.txt
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install -r requirements.txt
 
-COPY . /workspace/uuv_mujoco_v2_1
+COPY . /workspace/uuv_mujoco_v2_2
 
-ENTRYPOINT ["/workspace/uuv_mujoco_v2_1/docker/entrypoint.sh"]
+ENTRYPOINT ["/workspace/uuv_mujoco_v2_2/docker/entrypoint.sh"]
 CMD ["bash"]

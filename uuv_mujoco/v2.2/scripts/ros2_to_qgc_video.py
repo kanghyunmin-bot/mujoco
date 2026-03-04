@@ -7,6 +7,7 @@ from typing import Optional
 
 import cv2
 import rclpy
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from cv_bridge import CvBridge
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -39,7 +40,16 @@ class RosToQgcVideo(Node):
         self.last_report_wall = time.monotonic()
         self.sent_frames = 0
 
-        self.create_subscription(Image, self.topic, self._on_image, 5)
+        self.create_subscription(
+            Image,
+            self.topic,
+            self._on_image,
+            qos_profile=QoSProfile(
+                depth=1,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            ),
+        )
         self.get_logger().info(
             f"streaming {self.topic} -> udp://{self.host}:{self.port} "
             f"({self.fps:.1f}fps, {self.bitrate_kbps}kbps)"

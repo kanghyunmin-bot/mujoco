@@ -189,7 +189,7 @@ def main() -> None:
     parser.add_argument(
         "--ros2-sensor-hz",
         type=float,
-        default=50.0,
+        default=120.0,
         help="ROS2 IMU/DVL publish rate (Hz)",
     )
     parser.add_argument(
@@ -249,7 +249,7 @@ def main() -> None:
     parser.add_argument(
         "--sitl-mavlink-servo-hz",
         type=float,
-        default=80.0,
+        default=20.0,
         help="Requested SERVO_OUTPUT_RAW rate over MAVLink (Hz).",
     )
     parser.add_argument(
@@ -267,8 +267,8 @@ def main() -> None:
     parser.add_argument(
         "--sitl-mavlink-source-sysid",
         type=int,
-        default=255,
-        help="Source sysid for MuJoCo MAVLink listener.",
+        default=200,
+        help="Source sysid for MuJoCo MAVLink listener (use non-255 to avoid GCS collision).",
     )
     parser.add_argument(
         "--sitl-mavlink-source-compid",
@@ -350,20 +350,26 @@ def main() -> None:
     parser.add_argument(
         "--sitl-servo-map",
         type=str,
-        default="yaw_rf,yaw_lf,yaw_rr,yaw_lr,ver_rf,ver_lf,ver_rr,ver_lr",
+        default="yaw_rr,yaw_lr,yaw_rf,yaw_lf,ver_lf,ver_rf,ver_lr,ver_rr",
         help="Comma-separated thruster names mapped from SITL servo outputs 1..N, or 'auto' for mixer-inverse mode.",
     )
     parser.add_argument(
         "--sitl-servo-signs",
         type=str,
-        default="1,1,1,1,-1,-1,-1,-1",
+        default="1,1,1,1,1,1,1,1",
         help="Comma-separated sign multipliers for --sitl-servo-map entries, or 'auto'.",
     )
     parser.add_argument(
         "--sitl-servo-scale",
         type=float,
-        default=1.0,
+        default=0.75,
         help="Scale applied to direct-thruster normalized command from SITL PWM.",
+    )
+    parser.add_argument(
+        "--thruster-loop-hz",
+        type=float,
+        default=60.0,
+        help="Thruster force update rate (Hz), decoupled from physics timestep.",
     )
     parser.add_argument(
         "--sitl-roll-scale",
@@ -427,9 +433,9 @@ def main() -> None:
             "align_com_to_thruster_plane": False,
             "cob_y_offset": -0.010,
             "thruster_voltage": 16.0,
-            "thruster_force_max": 52.0,
-            "linear_drag": 1.05,
-            "angular_drag": 0.22,
+            "thruster_force_max": 21.0,
+            "linear_drag": 1.30,
+            "angular_drag": 0.32,
             "spin_gain": 22.0,
             "validation_timestep": 0.005,
             "validation_iterations": 20,
@@ -751,7 +757,7 @@ def main() -> None:
                 if enable_mavros_rc:
                     input_topics += ", /mavros/rc/override"
                 print(
-                    f"[bridge] enabled: {input_topics} -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude, /depth, /mujoco/ground_truth/pose"
+                    f"[bridge] enabled: {input_topics} -> control, /imu/data, /dvl/velocity, /dvl/odometry, /dvl/altitude, /depth, /bar30/pressure_pa, /mujoco/ground_truth/pose"
                     + (", /stereo/*" if args.ros2_images else ""),
                     flush=True,
                 )
@@ -803,6 +809,7 @@ def main() -> None:
 
     sensor_site_ids = {
         "imu": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "imu_site"),
+        "bar30": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "bar30_site"),
         "dvl": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "dvl_site"),
         "cam_left": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "cam_left_site"),
         "cam_right": mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "cam_right_site"),
@@ -1322,6 +1329,25 @@ def main() -> None:
         np.clip(sim_profile.get("air_angular_drag", angular_drag * 0.05), 0.0, angular_drag)
     )
     spin_gain = float(sim_profile.get("spin_gain", 22.0))
+    thruster_loop_hz = float(np.clip(args.thruster_loop_hz, 1.0, 500.0))
+    thruster_loop_dt = 1.0 / thruster_loop_hz
+    next_thruster_sim_time = {"value": -1.0}
+
+    def thruster_update_due() -> bool:
+        sim_t = float(data.time)
+        if next_thruster_sim_time["value"] < 0.0:
+            next_thruster_sim_time["value"] = sim_t
+        if sim_t + 1e-9 < next_thruster_sim_time["value"]:
+            return False
+        while sim_t + 1e-9 >= next_thruster_sim_time["value"]:
+            next_thruster_sim_time["value"] += thruster_loop_dt
+        return True
+
+    print(
+        f"[runtime] thruster loop rate: {thruster_loop_hz:.1f} Hz "
+        f"(physics dt={float(model.opt.timestep):.4f}s)",
+        flush=True,
+    )
     print(
         "[physics] buoyancy setup: "
         f"scale={buoyancy_scale:.3f}, mass={vehicle_mass:.3f}kg, "
@@ -1495,7 +1521,18 @@ def main() -> None:
             camera_mode["value"] = "free"
             follow_camera["value"] = False
 
-    def run_step(is_paused: bool) -> tuple[float, float, float, float]:
+    def publish_ros_once() -> None:
+        nonlocal ros_bridge
+        if ros_bridge is None:
+            return
+        try:
+            ros_bridge.publish(data)
+        except Exception as exc:
+            print(f"[ros2] publish failed, disabling bridge: {exc}", flush=True)
+            ros_bridge.shutdown()
+            ros_bridge = None
+
+    def run_step(is_paused: bool, publish_ros: bool = True) -> tuple[float, float, float, float]:
         """Run one control + physics + publish cycle."""
         nonlocal ros_bridge, last_tune_mtime
         if ros_bridge is not None:
@@ -1505,6 +1542,8 @@ def main() -> None:
                 print(f"[ros2] spin_once failed, disabling bridge: {exc}", flush=True)
                 ros_bridge.shutdown()
                 ros_bridge = None
+
+        thruster_due = thruster_update_due()
 
         if sitl_direct_thrusters:
             now = time.monotonic()
@@ -1564,18 +1603,15 @@ def main() -> None:
                     yaw_cmd_for_stab["value"] = 0.0
             if stale:
                 yaw_cmd_for_stab["value"] = 0.0
-            update_thruster_forces(model.opt.timestep)
-            update_propeller_visuals(model.opt.timestep if not is_paused else 0.0)
+            thr_dt = model.opt.timestep if not is_paused else 0.0
+            if thruster_due:
+                update_thruster_forces(thr_dt)
+            update_propeller_visuals(thr_dt)
             apply_underwater_wrench(model.opt.timestep if not is_paused else 0.0)
             if not is_paused:
                 mujoco.mj_step(model, data)
-            if ros_bridge is not None:
-                try:
-                    ros_bridge.publish(data)
-                except Exception as exc:
-                    print(f"[ros2] publish failed, disabling bridge: {exc}", flush=True)
-                    ros_bridge.shutdown()
-                    ros_bridge = None
+            if publish_ros:
+                publish_ros_once()
             return 0.0, 0.0, 0.0, 0.0
 
         if not viewer_control_mode["value"]:
@@ -1615,8 +1651,10 @@ def main() -> None:
                 update_stabilization(model.opt.timestep)
             apply_stabilization_thrusters()
 
-            update_thruster_forces(model.opt.timestep)
-            update_propeller_visuals(model.opt.timestep if not is_paused else 0.0)
+            thr_dt = model.opt.timestep if not is_paused else 0.0
+            if thruster_due:
+                update_thruster_forces(thr_dt)
+            update_propeller_visuals(thr_dt)
         else:
             forward = 0.0
             yaw = 0.0
@@ -1633,20 +1671,17 @@ def main() -> None:
                 apply_stabilization_thrusters()
             for name in ver_names:
                 thr_target[name] = float(np.clip(thr_target[name] + depth_hold_cmd_for_thrusters, -1.0, 1.0))
-            update_thruster_forces(model.opt.timestep)
-            update_propeller_visuals(model.opt.timestep if not is_paused else 0.0)
+            thr_dt = model.opt.timestep if not is_paused else 0.0
+            if thruster_due:
+                update_thruster_forces(thr_dt)
+            update_propeller_visuals(thr_dt)
 
         apply_underwater_wrench(model.opt.timestep if not is_paused else 0.0)
 
         if not is_paused:
             mujoco.mj_step(model, data)
-        if ros_bridge is not None:
-            try:
-                ros_bridge.publish(data)
-            except Exception as exc:
-                print(f"[ros2] publish failed, disabling bridge: {exc}", flush=True)
-                ros_bridge.shutdown()
-                ros_bridge = None
+        if publish_ros:
+            publish_ros_once()
         return forward, sway, yaw, heave
 
     if args.headless:
@@ -1672,6 +1707,17 @@ def main() -> None:
 
     with mujoco.viewer.launch_passive(model, data, key_callback=viewer_key_callback) as viewer:
         has_set_texts = hasattr(viewer, "set_texts")
+        target_dt = float(max(model.opt.timestep, 1e-6))
+        next_step_wall = time.perf_counter()
+        sensor_hz = float(max(args.ros2_sensor_hz, 1.0))
+        sensor_dt = 1.0 / sensor_hz
+        next_sensor_wall = time.perf_counter()
+        max_catchup_steps = max(4, int(round(0.10 / target_dt)))
+        max_sensor_catchup = max(2, int(round(0.10 / sensor_dt)))
+        forward = 0.0
+        sway = 0.0
+        yaw = 0.0
+        heave = 0.0
         while viewer.is_running() and not stop_event.is_set():
             # Respect GUI pause in passive viewer
             paused = False
@@ -1679,7 +1725,29 @@ def main() -> None:
                 flag = viewer.is_paused
                 paused = flag() if callable(flag) else bool(flag)
             is_paused = paused_flag["value"] or paused
-            forward, sway, yaw, heave = run_step(is_paused)
+            now_wall = time.perf_counter()
+            if is_paused:
+                forward, sway, yaw, heave = run_step(True, publish_ros=False)
+                next_step_wall = now_wall + target_dt
+                next_sensor_wall = now_wall + sensor_dt
+            else:
+                step_count = 0
+                while now_wall >= next_step_wall and step_count < max_catchup_steps:
+                    forward, sway, yaw, heave = run_step(False, publish_ros=False)
+                    next_step_wall += target_dt
+                    step_count += 1
+                    now_wall = time.perf_counter()
+                if step_count >= max_catchup_steps and now_wall >= next_step_wall:
+                    next_step_wall = now_wall + target_dt
+
+                sensor_count = 0
+                while ros_bridge is not None and now_wall >= next_sensor_wall and sensor_count < max_sensor_catchup:
+                    publish_ros_once()
+                    next_sensor_wall += sensor_dt
+                    sensor_count += 1
+                    now_wall = time.perf_counter()
+                if sensor_count >= max_sensor_catchup and now_wall >= next_sensor_wall:
+                    next_sensor_wall = now_wall + sensor_dt
 
             # Debug arrows for thruster directions (world frame)
             with viewer.lock():
@@ -1809,6 +1877,7 @@ def main() -> None:
                 # Sensor and camera markers
                 if show_sensor_overlay["value"]:
                     imu_id = sensor_site_ids.get("imu", -1)
+                    bar30_id = sensor_site_ids.get("bar30", -1)
                     dvl_id = sensor_site_ids.get("dvl", -1)
                     cam_l_id = sensor_site_ids.get("cam_left", -1)
                     cam_r_id = sensor_site_ids.get("cam_right", -1)
@@ -1816,6 +1885,10 @@ def main() -> None:
                         pos = data.site_xpos[imu_id].copy()
                         add_sphere(pos, 0.025, (1.0, 1.0, 0.1, 1.0))
                         add_label("IMU", pos + np.array([0.0, 0.03, 0.0]), (1.0, 1.0, 0.3, 1.0))
+                    if bar30_id >= 0:
+                        pos = data.site_xpos[bar30_id].copy()
+                        add_sphere(pos, 0.022, (0.2, 0.8, 1.0, 1.0))
+                        add_label("BAR30", pos + np.array([0.0, 0.03, 0.0]), (0.3, 0.9, 1.0, 1.0))
                     if dvl_id >= 0:
                         pos = data.site_xpos[dvl_id].copy()
                         add_sphere(pos, 0.025, (0.1, 1.0, 1.0, 1.0))
